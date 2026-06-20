@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Biometric Authentication System</title>
+</head>
+<body>
+    <!-- Header with controls -->
+    <header class="header">
+        <h1 class="header-title" data-i18n="app-title">Biometric Authentication</h1>
+        <div class="header-controls">
+            <button class="icon-btn" id="theme-toggle">
+                <span id="theme-icon">🌙</span>
+                <span data-i18n="theme">Theme</span>
+            </button>
+            <button class="icon-btn" id="lang-toggle">
+                <span id="lang-icon">🌐</span>
+                <span id="lang-text">EN</span>
+            </button>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- Login/Register Page -->
+        <div id="auth-page" class="card">
+            <h2 class="card-title" data-i18n="auth-title">Welcome</h2>
+            <p class="card-subtitle" data-i18n="auth-subtitle">Please login or register to continue</p>
+
+            <div class="form-group">
+                <label class="form-label" data-i18n="student-id">Student ID</label>
+                <input type="text" class="form-input" id="student-id" placeholder="Enter your student ID">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" data-i18n="full-name">Full Name</label>
+                <input type="text" class="form-input" id="full-name" placeholder="Enter your full name">
+            </div>
+
+            <div class="btn-group">
+                <button class="btn btn-secondary" id="login-btn" data-i18n="login">Login</button>
+                <button class="btn btn-primary" id="register-btn" data-i18n="register">Register</button>
+            </div>
+        </div>
+
+        <!-- Face Recognition Page -->
+        <div id="face-page" class="card hidden">
+            <h2 class="card-title" data-i18n="face-title">Face Recognition</h2>
+            <p class="card-subtitle" data-i18n="face-subtitle">Capture or upload video for authentication</p>
+
+            <div class="video-container">
+                <video id="video-preview" class="video-preview" autoplay playsinline muted></video>
+                <div id="video-placeholder" class="video-placeholder" data-i18n="video-placeholder">
+                    📹 Camera preview will appear here
+                </div>
+            </div>
+
+            <div class="file-upload" id="file-upload-area">
+                <div class="file-upload-icon">📁</div>
+                <p data-i18n="upload-text">Click to upload video or use camera</p>
+                <input type="file" class="file-input" id="video-file" accept="video/*">
+            </div>
+
+            <div class="btn-group">
+                <button class="btn btn-secondary" id="camera-btn" data-i18n="use-camera">Use Camera</button>
+                <button class="btn btn-primary" id="submit-btn" data-i18n="submit">Submit</button>
+            </div>
+
+            <button class="btn btn-secondary mt-1" id="back-btn" data-i18n="back">Back</button>
+
+            <div class="spinner" id="loading-spinner"></div>
+            <div class="status-message" id="status-message"></div>
+        </div>
+    </div>
+</body>
+</html>
