@@ -39,7 +39,7 @@ from sklearn.metrics import (
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 
-from config import Config, get_config
+from src.config import Config, get_config
 
 warnings.filterwarnings("ignore")
 

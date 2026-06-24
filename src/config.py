@@ -168,6 +168,58 @@ class PowerConfig:
 
 
 # ──────────────────────────────────────────────
+# Demo Config
+# ──────────────────────────────────────────────
+
+
+@dataclass
+class DemoPathConfig:
+    """File/directory paths used by the demo app."""
+    input_dir: str = "data/input"
+    model_path: str = "models/best.pth"
+    instance_file: str = "data/instance.json"
+    buffalo_model: str = "buffalo_l"          # insightface model name
+
+
+@dataclass
+class DemoCameraConfig:
+    """Camera capture settings."""
+    device_index: int = 0
+    target_frames: int = 64
+    fps: float = 20.0
+
+
+@dataclass
+class DemoModelConfig:
+    """MTL inference and identity matching thresholds."""
+    deepfake_threshold: float = 0.6
+    spoof_threshold: float = 0.6
+    temporal_threshold: float = 0.8
+    identity_threshold: float = 0.75          # cosine similarity
+    enroll_frame_indices: list = None         # filled in __post_init__
+
+    def __post_init__(self):
+        if self.enroll_frame_indices is None:
+            self.enroll_frame_indices = [20, 25, 30, 35, 40]
+
+
+@dataclass
+class DemoConfig:
+    """Top-level demo configuration."""
+    paths: DemoPathConfig = None
+    camera: DemoCameraConfig = None
+    model: DemoModelConfig = None
+
+    def __post_init__(self):
+        if self.paths is None:
+            self.paths = DemoPathConfig()
+        if self.camera is None:
+            self.camera = DemoCameraConfig()
+        if self.model is None:
+            self.model = DemoModelConfig()
+
+
+# ──────────────────────────────────────────────
 # Master Config
 # ──────────────────────────────────────────────
 @dataclass
@@ -178,6 +230,8 @@ class Config:
     aug: AugConfig = field(default_factory=AugConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     power: PowerConfig = field(default_factory=PowerConfig)
+    demo: DemoConfig = field(default_factory=DemoConfig)
+
 
     # Runtime (set automatically)
     device: str = "cuda"

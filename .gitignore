@@ -34,6 +34,8 @@ instance/
 data/datasets/
 data/raw/
 data/processed/
+data/input/
+data/sample/
 docs/articles/
 docs/proposal/
 *.zip
