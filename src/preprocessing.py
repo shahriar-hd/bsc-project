@@ -6,7 +6,7 @@ Directory structure output:
     ├── FaceForensics/
     │   ├── real/
     │   │   ├── sub_000000/
-    │   │   │   ├── c0_f000.png
+    │   │   │   ├── c0_f000.jpg
     │   │   │   └── ...
     │   │   └── sub_000001/
     │   └── fake/
@@ -23,9 +23,8 @@ Clip sampling:
 
 Face quality gate (per-frame, using buffalo_sc):
   - det_score  >= MIN_FACE_SCORE  (0.65)
-  - displacement from previous frame < DISP_RATIO × face_width
-    → frames that violate this are dropped; if a gap is created,
-      only the dense sub-run of >= MIN_VALID_FRAMES frames is kept.
+  - frames outside the clip-level mean bbox window are dropped;
+    if too few valid frames remain the clip is rejected.
 
 CSV outputs:
   master.csv          (all frames, all datasets)
@@ -45,7 +44,7 @@ import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 
-from mtl_config import Config
+from src.config import PreprocessConfig, get_config
 
 # --------------------------------------------------------------------------- #
 logging.basicConfig(
@@ -65,7 +64,7 @@ MAX_CLIPS_SIW: int = 1
 MIN_FACE_SCORE: float = 0.65
 MIN_VALID_FRAMES: int = 48           # 75 % of FRAMES_PER_CLIP
 MARGIN: int = 25                     # frames to skip at start/end of video
-DISP_RATIO: float = 0.30             # max allowed displacement / face_width
+DISP_RATIO: float = 0.30             # kept for log message only
 
 
 # =========================================================================== #
@@ -79,7 +78,11 @@ class FaceDetector:
     for the quality-gate / displacement checks done here.
     """
 
-    def __init__(self, config: Config, min_face_score: float = MIN_FACE_SCORE) -> None:
+    def __init__(
+        self,
+        config: PreprocessConfig,
+        min_face_score: float = MIN_FACE_SCORE,
+    ) -> None:
         self.min_face_score = min_face_score
         self.output_size: int = config.output_face_size
         self.crop_scale: float = config.crop_scale
@@ -178,7 +181,7 @@ def compute_clip_starts_ff(total_frames: int) -> List[int]:
     if total_frames < FRAMES_PER_CLIP + 2 * MARGIN:
         return []
 
-    usable_end = total_frames - MARGIN        # last valid start + FRAMES_PER_CLIP
+    usable_end = total_frames - MARGIN
 
     # clip-0: early
     s0 = MARGIN
@@ -190,7 +193,7 @@ def compute_clip_starts_ff(total_frames: int) -> List[int]:
 
     # clip-2: late
     s2 = usable_end - FRAMES_PER_CLIP
-    s2 = max(s1 + FRAMES_PER_CLIP, s2)       # ensure no overlap with clip-1
+    s2 = max(s1 + FRAMES_PER_CLIP, s2)
 
     starts = [s0]
     if s1 > s0:
@@ -198,7 +201,6 @@ def compute_clip_starts_ff(total_frames: int) -> List[int]:
     if s2 > (starts[-1] + FRAMES_PER_CLIP - 1) and s2 != s0:
         starts.append(s2)
 
-    # Keep at most 3 and ensure within bounds.
     return [s for s in starts[:3] if s + FRAMES_PER_CLIP <= total_frames]
 
 
@@ -265,6 +267,7 @@ def extract_clip(
     detector: FaceDetector,
     out_dir: Path,
     clip_idx: int,
+    config: PreprocessConfig,
 ) -> List[Dict]:
     """
     Extract one temporally-stable clip in two passes.
@@ -281,29 +284,26 @@ def extract_clip(
         are skipped (subject-level jitter, e.g. scene cut).
         Apply the fixed window crop and save as JPEG.
 
-    Why two passes?
-        We need all bboxes before we can compute the average window,
-        so we must read and detect on the full clip before saving anything.
-
     Args:
         video_path:  Source video file.
         start_frame: Index of the first frame of this clip in the video.
         detector:    Initialised FaceDetector.
         out_dir:     Subject-level output directory.
         clip_idx:    Clip index within this video (0-based).
+        config:      PreprocessConfig instance (for jpeg_quality etc.).
 
     Returns:
         List of frame-level record dicts; empty list if clip is rejected.
     """
-    encode_params = [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality]
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, config.jpeg_quality]
 
     # ── Pass 1: read all frames, detect faces, collect bboxes ────────────── #
-    raw_frames: List[Tuple[int, np.ndarray]] = []          # (src_idx, bgr)
-    per_frame_bbox: List[Optional[np.ndarray]] = []        # None = no detection
+    raw_frames: List[Tuple[int, np.ndarray]] = []
+    per_frame_bbox: List[Optional[np.ndarray]] = []
 
     for src_idx, bgr in read_consecutive_frames(video_path, start_frame, FRAMES_PER_CLIP):
         raw_frames.append((src_idx, bgr))
-        face = detector.detect_best(bgr)                   # may return None
+        face = detector.detect_best(bgr)
         per_frame_bbox.append(face.bbox if face is not None else None)
 
     if len(raw_frames) < MIN_VALID_FRAMES:
@@ -332,20 +332,17 @@ def extract_clip(
     # ── Pass 2: validate each frame against the fixed window, then save ───── #
     out_dir.mkdir(parents=True, exist_ok=True)
     records: List[Dict] = []
-    saved_idx: int = 0                                      # sequential frame number
+    saved_idx: int = 0
 
     for (src_idx, bgr), bbox in zip(raw_frames, per_frame_bbox):
-        # Frame has no face at all → subject jumped / occluded
         if bbox is None:
             logger.debug("Clip %d frame %d: no detection → skip", clip_idx, src_idx)
             continue
 
-        # Face detected but outside our stable window → subject jump
         if not _face_inside_window(bbox, crop_coords):
             logger.debug("Clip %d frame %d: face outside window → skip", clip_idx, src_idx)
             continue
 
-        # Crop using the fixed clip-level window
         ix1, iy1, ix2, iy2 = crop_coords
         region = bgr[iy1:iy2, ix1:ix2]
         crop = cv2.resize(
@@ -388,23 +385,12 @@ def _compute_average_crop_coords(
 ) -> Optional[Tuple[int, int, int, int]]:
     """
     Average all detected bboxes across a clip → one stable crop window.
-
-    This eliminates frame-level jitter: the window itself never moves,
-    only the face may drift slightly within it.
-
-    Args:
-        bboxes:      List of [x1,y1,x2,y2] from InsightFace for each frame.
-        frame_shape: (H, W) of the source video.
-        crop_scale:  Scale factor applied to the face bounding box.
-        output_size: Final square output resolution (unused here, for clarity).
-    Returns:
-        (ix1, iy1, ix2, iy2) clamped to frame boundaries, or None if degenerate.
     """
     if not bboxes:
         return None
 
-    arr = np.stack(bboxes, axis=0)          # (N, 4)
-    mean_bbox = arr.mean(axis=0)            # [x1, y1, x2, y2]
+    arr = np.stack(bboxes, axis=0)
+    mean_bbox = arr.mean(axis=0)
 
     x1, y1, x2, y2 = map(float, mean_bbox)
     cx = (x1 + x2) / 2.0
@@ -429,16 +415,6 @@ def _face_inside_window(
 ) -> bool:
     """
     Check whether a detected face bbox overlaps enough with the clip window.
-
-    A loose IoU threshold (0.30) catches genuine subject jumps / cuts
-    without being sensitive to normal head movement.
-
-    Args:
-        bbox:          [x1, y1, x2, y2] detected face.
-        crop_coords:   (ix1, iy1, ix2, iy2) clip-level fixed window.
-        iou_threshold: Minimum IoU to consider the face "inside" the window.
-    Returns:
-        True if IoU >= threshold.
     """
     fx1, fy1, fx2, fy2 = map(float, bbox)
     wx1, wy1, wx2, wy2 = map(float, crop_coords)
@@ -468,7 +444,7 @@ def _face_inside_window(
 VideoMeta = Dict[str, object]
 
 
-def scan_ff(config: Config) -> List[VideoMeta]:
+def scan_ff(config: PreprocessConfig) -> List[VideoMeta]:
     root = config.raw_data_root / config.ff_dataset_name
     records: List[VideoMeta] = []
     for label_str, subdir in [("real", config.ff_real_dir), ("fake", config.ff_fake_dir)]:
@@ -480,17 +456,17 @@ def scan_ff(config: Config) -> List[VideoMeta]:
             if vid.suffix.lower() in config.video_extensions:
                 records.append({
                     "video_path": str(vid),
-                    "dataset": config.ff_dataset_name,
+                    "dataset":    config.ff_dataset_name,
                     "subject_id": f"ff_{vid.stem}",
-                    "label": label_str,
-                    "task": "deepfake",
+                    "label":      label_str,
+                    "task":       "deepfake",
                     "spoof_type": "none",
                 })
     logger.info("FF++ scanned: %d videos", len(records))
     return records
 
 
-def scan_siw(config: Config) -> List[VideoMeta]:
+def scan_siw(config: PreprocessConfig) -> List[VideoMeta]:
     root = config.raw_data_root / config.siw_dataset_name
     records: List[VideoMeta] = []
 
@@ -500,10 +476,10 @@ def scan_siw(config: Config) -> List[VideoMeta]:
             if vid.suffix.lower() in config.video_extensions:
                 records.append({
                     "video_path": str(vid),
-                    "dataset": config.siw_dataset_name,
+                    "dataset":    config.siw_dataset_name,
                     "subject_id": f"siw_{vid.stem}",
-                    "label": "real",
-                    "task": "spoof",
+                    "label":      "real",
+                    "task":       "spoof",
                     "spoof_type": "live",
                 })
 
@@ -517,10 +493,10 @@ def scan_siw(config: Config) -> List[VideoMeta]:
             if vid.suffix.lower() in config.video_extensions:
                 records.append({
                     "video_path": str(vid),
-                    "dataset": config.siw_dataset_name,
+                    "dataset":    config.siw_dataset_name,
                     "subject_id": f"siw_{spoof_type}_{vid.stem}",
-                    "label": "spoof",
-                    "task": "spoof",
+                    "label":      "spoof",
+                    "task":       "spoof",
                     "spoof_type": spoof_type,
                 })
 
@@ -531,7 +507,10 @@ def scan_siw(config: Config) -> List[VideoMeta]:
 # =========================================================================== #
 # Subject-aware split
 # =========================================================================== #
-def split_by_subject(records: List[VideoMeta], config: Config) -> List[VideoMeta]:
+def split_by_subject(
+    records: List[VideoMeta],
+    config: PreprocessConfig,
+) -> List[VideoMeta]:
     subjects: Dict[str, List[int]] = defaultdict(list)
     for i, rec in enumerate(records):
         subjects[str(rec["subject_id"])].append(i)
@@ -542,14 +521,18 @@ def split_by_subject(records: List[VideoMeta], config: Config) -> List[VideoMeta
 
     n = len(ids)
     n_train = int(n * config.train_ratio)
-    n_val = int(n * config.val_ratio)
+    n_val   = int(n * config.val_ratio)
 
     train_set = set(ids[:n_train])
-    val_set = set(ids[n_train: n_train + n_val])
+    val_set   = set(ids[n_train: n_train + n_val])
 
     for rec in records:
         sid = str(rec["subject_id"])
-        rec["split"] = "train" if sid in train_set else ("val" if sid in val_set else "test")
+        rec["split"] = (
+            "train" if sid in train_set else
+            "val"   if sid in val_set   else
+            "test"
+        )
 
     counts: Counter = Counter(str(r["split"]) for r in records)
     logger.info(
@@ -566,25 +549,17 @@ def process_video(
     meta: VideoMeta,
     video_index: int,
     detector: FaceDetector,
-    config: Config,
+    config: PreprocessConfig,
 ) -> List[Dict]:
     """
     Extract all clips for one video and save frames under a subject subfolder.
 
     Output path:
-        processed/<dataset>/<label>/<subject_dir>/c<i>_f<nnn>.png
-
-    Args:
-        meta:        Video metadata dict (must include 'split' key).
-        video_index: Global index used for subject folder naming.
-        detector:    Initialised FaceDetector.
-        config:      Config instance.
-    Returns:
-        List of frame-level record dicts with all metadata.
+        processed/<dataset>/<label>/sub_<000000>/c<i>_f<nnn>.jpg
     """
     video_path = Path(str(meta["video_path"]))
-    dataset = str(meta["dataset"])
-    label = str(meta["label"])
+    dataset    = str(meta["dataset"])
+    label      = str(meta["label"])
     subject_id = str(meta["subject_id"])
 
     total_frames = get_frame_count(video_path)
@@ -592,7 +567,6 @@ def process_video(
         logger.warning("Cannot read: %s", video_path)
         return []
 
-    # Determine clip starts based on dataset.
     is_ff = (dataset == config.ff_dataset_name)
     if is_ff:
         clip_starts = compute_clip_starts_ff(total_frames)
@@ -604,10 +578,8 @@ def process_video(
         logger.warning("Too short (%d frames): %s", total_frames, video_path)
         return []
 
-    # Subject-level directory: processed/<dataset>/<label>/sub_<000000>/
-    subject_dir_name = f"sub_{video_index:06d}"
     subject_out_dir = (
-        config.processed_root / dataset / label / subject_dir_name
+        config.processed_root / dataset / label / f"sub_{video_index:06d}"
     )
 
     all_records: List[Dict] = []
@@ -619,6 +591,7 @@ def process_video(
             detector=detector,
             out_dir=subject_out_dir,
             clip_idx=clip_idx,
+            config=config,                    # ← passed explicitly
         )
 
         if not clip_records:
@@ -627,17 +600,16 @@ def process_video(
             )
             continue
 
-        # Attach video-level metadata to each frame record.
         for rec in clip_records:
             rec.update({
-                "video_path": str(meta["video_path"]),
-                "dataset": dataset,
-                "subject_id": subject_id,
+                "video_path":  str(meta["video_path"]),
+                "dataset":     dataset,
+                "subject_id":  subject_id,
                 "subject_dir": str(subject_out_dir),
-                "label": label,
-                "task": str(meta["task"]),
-                "spoof_type": str(meta["spoof_type"]),
-                "split": str(meta["split"]),
+                "label":       label,
+                "task":        str(meta["task"]),
+                "spoof_type":  str(meta["spoof_type"]),
+                "split":       str(meta["split"]),
                 "video_index": video_index,
             })
 
@@ -672,16 +644,12 @@ def write_all_csvs(all_records: List[Dict], csv_dir: Path) -> None:
         master.csv
         ff_train.csv / ff_val.csv / ff_test.csv
         siw_train.csv / siw_val.csv / siw_test.csv
-
-    Args:
-        all_records: All frame-level records.
-        csv_dir:     Directory to write CSV files into.
     """
     write_csv(all_records, csv_dir / "master.csv")
 
     dataset_key = {
-        "FaceForensics": "ff",
-        "SiW-Mv2":       "siw",
+        "FaceForensics++": "ff",
+        "SiW-Mv2":         "siw",
     }
 
     for dataset_name, prefix in dataset_key.items():
@@ -698,11 +666,11 @@ def write_all_csvs(all_records: List[Dict], csv_dir: Path) -> None:
 # Summary
 # =========================================================================== #
 def log_summary(all_records: List[Dict]) -> None:
-    unique_clips = len(set((r["video_index"], r["clip_index"]) for r in all_records))
+    unique_clips    = len(set((r["video_index"], r["clip_index"]) for r in all_records))
     unique_subjects = len(set(r["subject_id"] for r in all_records))
-    by_split = Counter(r["split"] for r in all_records)
-    by_task = Counter(r["task"] for r in all_records)
-    by_label = Counter(r["label"] for r in all_records)
+    by_split  = Counter(r["split"]  for r in all_records)
+    by_task   = Counter(r["task"]   for r in all_records)
+    by_label  = Counter(r["label"]  for r in all_records)
 
     logger.info("── Summary ──────────────────────────────────")
     logger.info("  Total frames   : %d", len(all_records))
@@ -717,7 +685,7 @@ def log_summary(all_records: List[Dict]) -> None:
 # =========================================================================== #
 # Pipeline entry
 # =========================================================================== #
-def run_pipeline(config: Config) -> None:
+def run_pipeline(config: PreprocessConfig) -> None:
     logger.info("=== Preprocessing pipeline started ===")
     logger.info(
         "Clip settings: %d frames/clip | FF++: %d clips | SiW: %d clip",
@@ -770,5 +738,5 @@ def run_pipeline(config: Config) -> None:
 
 
 if __name__ == "__main__":
-    cfg = Config()
-    run_pipeline(cfg)
+    cfg = get_config()
+    run_pipeline(cfg.preprocess)
