@@ -1,19 +1,130 @@
 """
-Central configuration for MTL training (deepfake, anti-spoof, temporal heads).
-All tunable hyperparameters and paths are defined here.
+config.py
+Central configuration for the entire project:
+  - preprocessing pipeline  (PreprocessConfig)
+  - model architecture      (ModelConfig)
+  - training                (TrainConfig)
+  - augmentation            (AugConfig)
+  - evaluation              (EvalConfig)
+  - power monitoring        (PowerConfig)
+  - demo app                (DemoConfig)
 """
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 
-# ──────────────────────────────────────────────
-# Paths
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Preprocessing
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PreprocessConfig:
+    # ── Paths ─────────────────────────────────────────────────────────────────
+    raw_data_root: Path = Path(
+        "/home/shahriar/Documents/bank_did_auth/data/datasets/raw"
+    )
+    processed_root: Path = Path(
+        "/home/shahriar/Documents/bank_did_auth/data/datasets/processed"
+    )
+    master_csv_path: Path = Path(
+        "/home/shahriar/Documents/bank_did_auth/data/datasets/master.csv"
+    )
+
+    # ── Dataset names (must match folder names under raw_data_root) ───────────
+    ff_dataset_name: str = "FaceForensics++"
+    siw_dataset_name: str = "SiW-Mv2"
+
+    # FaceForensics++ sub-folders
+    ff_real_dir: str = "real"
+    ff_fake_dir: str = "fake"
+
+    # SiW-Mv2 sub-folders
+    siw_live_dir: str = "live"
+    siw_spoof_dir: str = "spoof"
+    siw_spoof_types: List[str] = field(default_factory=lambda: [
+        "Makeup_Cosmetic",
+        "Makeup_Impersonation",
+        "Makeup_Obfuscation",
+        "Mannequin",
+        "Mask_HalfMask",
+        "Mask_PaperMask",
+        "Mask_TransparentMask",
+        "Paper",
+        "Partial_Eye",
+        "Partial_FunnyeyeGlasses",
+        "Partial_Mouth",
+        "Partial_PaperGlasses",
+        "Replay",
+        "Silicone",
+    ])
+
+    # ── Video extensions to scan ──────────────────────────────────────────────
+    video_extensions: Tuple[str, ...] = (".mp4", ".avi", ".mov", ".mkv")
+
+    # ── InsightFace / Buffalo_L ───────────────────────────────────────────────
+    insightface_model_name: str = "buffalo_l"
+    insightface_ctx_id: int = 0           # GPU id; -1 for CPU
+    insightface_det_size: Tuple[int, int] = (640, 640)
+
+    # ── Face crop & output image ──────────────────────────────────────────────
+    output_face_size: int = 224           # final square crop (px)
+    crop_scale: float = 1.1               # padding around aligned face
+
+    # ── Bounding-box smoothing ────────────────────────────────────────────────
+    # Exponential moving average alpha for bbox smoothing.
+    # Lower = more smoothing, higher = faster response to real motion.
+    bbox_ema_alpha: float = 0.35
+
+    # Max allowed per-frame displacement relative to face size before a
+    # detection is treated as jitter (not real motion).
+    # Expressed as fraction of the face's shorter side.
+    bbox_jitter_threshold: float = 0.40
+
+    # Number of consecutive "jitter" frames allowed before we accept the
+    # new position as genuine subject motion.
+    bbox_jitter_tolerance: int = 3
+
+    # ── Frame sampling ────────────────────────────────────────────────────────
+    # Target clip length (number of frames per clip stored in CSV).
+    t_clip: int = 64
+
+    # Skip every N source frames before sampling a clip frame.
+    # At 30 fps: skip=2 → effective 10 fps input to clip.
+    # At 60 fps: skip=4 → same effective rate.
+    frame_skip: int = 2
+
+    # Minimum frames that must be extracted from a video for it to be
+    # included in the dataset.
+    min_frames_per_video: int = 8
+
+    # ── Train / Val / Test split ratios (must sum to 1.0) ─────────────────────
+    train_ratio: float = 0.70
+    val_ratio: float = 0.15
+    test_ratio: float = 0.15
+
+    # Random seed for reproducible splits
+    split_seed: int = 42
+
+    # ── Misc ──────────────────────────────────────────────────────────────────
+    log_every_n_videos: int = 20          # progress log interval
+    jpeg_quality: int = 92                # 90-95: sharp enough, ~3× smaller than PNG
+    frames_per_clip: int = 64
+    min_valid_frames: int = 48
+    min_face_score: float = 0.65
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Paths  (training artefacts)
+# ══════════════════════════════════════════════════════════════════════════════
+
 @dataclass
 class PathConfig:
-    data_root: str = "/home/shahriar/Documents/bank_did_auth/data/datasets/processed/"
+    data_root: str = (
+        "/home/shahriar/Documents/bank_did_auth/data/datasets/processed/"
+    )
     csv_root: str = data_root + "csv/"
     master_csv: str = csv_root + "master.csv"
     siwmv2_train_csv: str = csv_root + "SiW-Mv2_train.csv"
@@ -29,9 +140,10 @@ class PathConfig:
     result_csv: str = "results.csv"
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Model
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 @dataclass
 class ModelConfig:
     backbone: str = "efficientnet_b2"          # or "vit_small_patch16_224"
@@ -53,9 +165,10 @@ class ModelConfig:
     tsm_shift_ratio: float = 0.125
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Training
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 @dataclass
 class TrainConfig:
     seed: int = 42
@@ -115,9 +228,10 @@ class TrainConfig:
     ff_sample_ratio: float = 0.5
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Augmentation
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 @dataclass
 class AugConfig:
     image_size: int = 224
@@ -139,9 +253,10 @@ class AugConfig:
     random_grayscale_p: float = 0.05
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Evaluation
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 @dataclass
 class EvalConfig:
     eval_every: int = 1                        # evaluate every N epochs
@@ -152,9 +267,10 @@ class EvalConfig:
     c40_label: str = "c40"
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Power Monitoring
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 @dataclass
 class PowerConfig:
     enable: bool = True
@@ -167,10 +283,9 @@ class PowerConfig:
     rapl_path: str = "/sys/class/powercap/intel-rapl"
 
 
-# ──────────────────────────────────────────────
-# Demo Config
-# ──────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Demo
+# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class DemoPathConfig:
@@ -196,7 +311,7 @@ class DemoModelConfig:
     spoof_threshold: float = 0.6
     temporal_threshold: float = 0.8
     identity_threshold: float = 0.75          # cosine similarity
-    enroll_frame_indices: list = None         # filled in __post_init__
+    enroll_frame_indices: List[int] = None    # filled in __post_init__
 
     def __post_init__(self):
         if self.enroll_frame_indices is None:
@@ -219,11 +334,13 @@ class DemoConfig:
             self.model = DemoModelConfig()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # Master Config
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 @dataclass
 class Config:
+    preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     paths: PathConfig = field(default_factory=PathConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -231,7 +348,6 @@ class Config:
     eval: EvalConfig = field(default_factory=EvalConfig)
     power: PowerConfig = field(default_factory=PowerConfig)
     demo: DemoConfig = field(default_factory=DemoConfig)
-
 
     # Runtime (set automatically)
     device: str = "cuda"
