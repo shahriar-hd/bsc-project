@@ -38,6 +38,7 @@ data/input/
 data/sample/
 docs/articles/
 docs/proposal/
+instance*
 *.zip
 *.rar
 

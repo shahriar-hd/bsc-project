@@ -27,10 +27,10 @@ class PreprocessConfig:
         "/home/shahriar/Documents/bank_did_auth/data/datasets/raw"
     )
     processed_root: Path = Path(
-        "/home/shahriar/Documents/bank_did_auth/data/datasets/processed"
+        "/home/shahriar/Documents/bsc-project/data/datasets/processed"
     )
     master_csv_path: Path = Path(
-        "/home/shahriar/Documents/bank_did_auth/data/datasets/master.csv"
+        "/home/shahriar/Documents/bsc-project/data/datasets/processed/csv/master.csv"
     )
 
     # ── Dataset names (must match folder names under raw_data_root) ───────────
@@ -123,7 +123,7 @@ class PreprocessConfig:
 @dataclass
 class PathConfig:
     data_root: str = (
-        "/home/shahriar/Documents/bank_did_auth/data/datasets/processed/"
+        "/home/shahriar/Documents/bsc-project/data/datasets/processed/"
     )
     csv_root: str = data_root + "csv/"
     master_csv: str = csv_root + "master.csv"

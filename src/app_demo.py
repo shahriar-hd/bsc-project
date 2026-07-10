@@ -502,6 +502,101 @@ def login_flow(face_app: FaceAnalysis, mtl_model, device: torch.device) -> None:
     print("  ──────────────────────────────────────────────────\n")
 
 
+def test_batch(
+    face_app: FaceAnalysis,
+    mtl_model,
+    device: torch.device,
+) -> None:
+    """Batch-process all video files in a given directory."""
+
+    video_exts = {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
+
+    input_path = input("  Batch video directory: ").strip()
+    subject_id = input("  Subject ID: ").strip()
+
+    video_dir = Path(input_path)
+    if not video_dir.is_dir():
+        print(f"  [ERROR] Directory not found: {video_dir}")
+        return
+
+    videos = sorted(p for p in video_dir.iterdir() if p.suffix.lower() in video_exts)
+    if not videos:
+        print("  [ERROR] No video files found in the directory.")
+        return
+
+    print(f"\n  Found {len(videos)} video(s). Starting batch..\n")
+
+    results = []
+    batch_start = time.time()
+
+    for idx, video_path in enumerate(videos, 1):
+        print(f"  [{idx}/{len(videos)}] Processing: {video_path.name}")
+        t0 = time.time()
+
+        try:
+            run_dir = next_run_dir(subject_id)
+            frame_paths, cropped_faces, embeddings = capture_from_file(
+                str(video_path),
+                run_dir,
+                face_app,
+            )
+            passed = process_frames(
+                frame_paths,
+                run_dir,
+                cropped_faces,
+                embeddings,
+                mtl_model,
+                device,
+            )
+            elapsed = round(time.time() - t0, 3)
+            status = "passed" if passed else "blocked"
+            print(f"    → {status} ({elapsed}s)\n")
+            results.append({
+                "video":    video_path.name,
+                "run_dir":  str(run_dir),
+                "status":   status,
+                "elapsed_s": elapsed,
+                "error":    None,
+            })
+
+        except RuntimeError as exc:
+            elapsed = round(time.time() - t0, 3)
+            print(f"    → ERROR: {exc} ({elapsed}s)\n")
+            results.append({
+                "video":    video_path.name,
+                "run_dir":  None,
+                "status":   "error",
+                "elapsed_s": elapsed,
+                "error":    str(exc),
+            })
+
+    total_elapsed = round(time.time() - batch_start, 3)
+    passed_count  = sum(1 for r in results if r["status"] == "passed")
+    blocked_count = sum(1 for r in results if r["status"] == "blocked")
+    error_count   = sum(1 for r in results if r["status"] == "error")
+
+    summary = {
+        "subject_id":   subject_id,
+        "total_videos": len(videos),
+        "passed":       passed_count,
+        "blocked":      blocked_count,
+        "errors":       error_count,
+        "total_elapsed_s": total_elapsed,
+        "results":      results,
+    }
+
+    out_file = video_dir / "batch_results.json"
+    out_file.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+
+    print("  ── Batch Summary ────────────")
+    print(f"  Total   : {len(videos)}")
+    print(f"  Passed  : {passed_count}")
+    print(f"  Blocked : {blocked_count}")
+    print(f"  Errors  : {error_count}")
+    print(f"  Time    : {total_elapsed}s")
+    print(f"  Report  → {out_file}\n")
+
+
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -519,7 +614,7 @@ def main() -> None:
     print("  Models loaded.\n")
 
     while True:
-        choice = input("  [r=register | l=login | q=quit] > ").strip().lower()
+        choice = input("  [r=register | l=login | q=quit | b=batch] > ").strip().lower()
         if choice == "q":
             print("  Bye.")
             break
@@ -527,6 +622,8 @@ def main() -> None:
             register_flow(face_app, mtl_model, device)
         elif choice == "l":
             login_flow(face_app, mtl_model, device)
+        elif choice == "b":
+            test_batch(face_app, mtl_model, device)
         else:
             print("  Unknown option. Use r / l / q.")
 
