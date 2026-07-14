@@ -134,7 +134,7 @@ class PreprocessConfig:
 
 @dataclass
 class PathConfig:
-    data_root: str = (
+    data_root: str = ( # TODO: Change path
         "/home/shahriar/Documents/bsc-project/data/datasets/processed/"
     )
     csv_root: str = data_root + "csv/"
@@ -177,7 +177,7 @@ class ModelConfig:
     tsm_shift_ratio: float = 0.125
 
     # ── Temporal head redesign ───────────────────────────────────────────────
-    temporal_supervision: str = "pseudo_label"
+    temporal_supervision: str = "combined"
     # "cosine_sim"   → original (kept for ablation)
     # "pseudo_label" → mean of adjacent deepfake predictions (recommended)
     # "optical_flow" → uses precomputed optical flow signal
@@ -195,14 +195,14 @@ class ModelConfig:
 class TrainConfig:
     seed: int = 42
     num_epochs: int = 25
-    batch_size: int = 16                       # per GPU
+    batch_size: int = 16                       # per GPU TODO: change batch size
     num_workers: int = 4
     pin_memory: bool = True
     grad_accum_steps: int = 2                  # effective batch = batch_size * accum
-    resume: bool = True
+    resume: bool = False                        # TODO: True 
 
     # Temporal sampling
-    num_frames: int = 8                        # T frames per clip
+    num_frames: int = 16                       # T frames per clip
     temporal_jitter: bool = True
     min_frame_gap: int = 1
     max_frame_gap: int = 4
@@ -227,13 +227,10 @@ class TrainConfig:
     use_gradnorm: bool = True
     gradnorm_alpha: float = 1.5               # task difficulty balancing
 
-    # PCGrad (conflict resolution)
-    use_pcgrad: bool = True
-
     # Initial task loss weights
     w_deepfake: float = 1.0
     w_spoof: float = 1.0
-    w_temporal: float = 0.5
+    w_temporal: float = 1.0
 
     # Focal loss (spoof head)
     focal_gamma: float = 2.0
@@ -248,13 +245,13 @@ class TrainConfig:
     max_grad_norm: float = 5.0
 
     # Interleaved sampling ratio (FF++ : SiW-Mv2)
-    ff_sample_ratio: float = 0.5
+    ff_sample_ratio: float = 1.0
 
     # ── Device & precision ──────────────────────────────────────────────────
     device: str = "cuda"               # "cuda", "cpu", or "cuda:0,1,..."
     amp_dtype: str = "float16"         # "float16" | "bfloat16" | "float32" (float32 = AMP disabled)
     fallback_to_cpu: bool = True       # if CUDA unavailable, fall back to CPU silently
-
+    # TODO:
     # ── Multi-GPU ────────────────────────────────────────────────────────────
     use_ddp: bool = False              # DistributedDataParallel (multi-node)
     use_data_parallel: bool = True     # DataParallel (single-node multi-GPU, simpler)
@@ -267,7 +264,7 @@ class TrainConfig:
     early_stopping_metric: str = "primary"  # "primary" | "df_auc" | "sp_auc" | "acer"
     early_stopping_mode: str = "max"        # "max" for AUC, "min" for ACER
 
-    # ── Warmup (was defined but not implemented) ─────────────────────────────
+    # ── Warmup ─────────────────────────────
     warmup_epochs: int = 3             # linear warmup before cosine schedule
 
     # ── Optical flow for temporal branch ────────────────────────────────────
@@ -276,43 +273,14 @@ class TrainConfig:
     optical_flow_channels: int = 2          # dx, dy → 2 channels appended to RGB
     optical_flow_cache: bool = True         # cache precomputed flows to disk
 
-    # Device & precision
-    device: str = "cuda:0"
-    fallback_to_cpu: bool = True
-    amp_dtype: str = "float16"          # "float32" | "float16" | "bfloat16"
-    gpu_ids: List[int] = field(default_factory=list)
-    use_data_parallel: bool = False
-
-    # Early stopping
-    use_early_stopping: bool = True
-    early_stopping_patience: int = 7
-    early_stopping_min_delta: float = 1e-4
-    early_stopping_mode: str = "max"    # "max" for AUC, "min" for loss
-    early_stopping_metric: str = "deepfake_auc"
-
-    # GradNorm
-    use_gradnorm: bool = True
-    gradnorm_alpha: float = 1.5
-    w_deepfake: float = 1.0
-    w_spoof: float = 1.0
-    w_temporal: float = 0.5
-
     # PCGrad
     use_pcgrad: bool = True
 
     # Temporal supervision
-    use_optical_flow: bool = False       # True = فعال‌سازی optical flow
     flow_resize: int = 112
     pseudo_label_weight: float = 0.3
     flow_loss_weight: float = 0.2
     temporal_supervision: str = "combined"  # "pseudo_label" | "optical_flow" | "combined"
-
-    # Warmup
-    warmup_epochs: int = 3
-
-    # Gradient
-    max_grad_norm: float = 1.0
-    grad_accum_steps: int = 2
 
 
 
@@ -367,7 +335,7 @@ class PowerConfig:
     ram_coeff: float = 0.375                  # W per GB used (DDR4 ~3W/8GB)
     ssd_coeff: float = 2.0                    # W fixed estimate for NVMe SSD
     other_coeff: float = 5.0                  # W for mobo, fans, etc.
-    # RAPL paths (Linux)
+    # RAPL paths (Linux) TODO: run <sudo chmod -R a+r /sys/class/powercap/intel-rapl> in cli first
     rapl_path: str = "/sys/class/powercap/intel-rapl"
 
     # ── Multi-GPU power monitoring ───────────────────────────────────────────
