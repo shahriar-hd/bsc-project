@@ -605,7 +605,7 @@ def main() -> None:
     print(  "╚══════════════════════════════════════╝\n")
 
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    device = torch.device("cuda")
     print(f"  Device : {device}")
 
     print("  Loading models…")

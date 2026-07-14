@@ -3,6 +3,7 @@ MTL training script for three heads: deepfake, anti-spoof, temporal consistency.
 Supports GradNorm, PCGrad, TSM, AMP, OOM fallback, power monitoring, and full metrics.
 """
 
+import contextlib
 import os
 import gc
 import csv
@@ -38,6 +39,7 @@ from sklearn.metrics import (
 )
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
+from tqdm import tqdm
 
 from src.config import Config, get_config
 
@@ -114,72 +116,264 @@ def get_last_run_id(checkpoint_root: str) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Power Monitor
 # ──────────────────────────────────────────────────────────────────────────────
+# ─── REPLACE the existing PowerMonitor class in train.py ─────────────────────
+
+import threading
+import time
+import subprocess
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+
+@dataclass
+class GPUSample:
+    """Single power sample for one GPU device."""
+    gpu_id: int
+    power_w: float
+    timestamp: float
+
 
 class PowerMonitor:
-    """Background thread that polls GPU (nvidia-smi) and CPU (intel-rapl) power."""
+    """
+    Background thread that polls CPU (RAPL), RAM, and one or more CUDA GPUs.
 
-    def __init__(self, cfg: Config):
-        """Initialize monitor with config."""
-        self.cfg = cfg
-        self.readings: List[float] = []        # total watts per sample
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._poll, daemon=True)
+    Supports single and multi-GPU setups. Per-GPU power is collected via
+    `nvidia-smi`. CPU power is read from the Intel RAPL sysfs interface.
 
-    def start(self):
-        """Start background polling."""
-        self._thread.start()
+    Args:
+        poll_interval: seconds between samples
+        rapl_path: sysfs path prefix for Intel RAPL
+        ram_coeff: W per GB of system RAM (estimate)
+        ssd_coeff: W for SSD activity (estimate)
+        other_coeff: W for misc board components (estimate)
+        gpu_ids: list of CUDA device indices to monitor; empty = all visible
+        per_gpu_log: if True, store per-GPU breakdown alongside aggregates
+    """
 
-    def stop(self):
-        """Stop polling and return mean watt consumption."""
-        self._stop.set()
-        self._thread.join()
-        return float(np.mean(self.readings)) if self.readings else 0.0
+    def __init__(
+        self,
+        poll_interval: float = 5.0,
+        rapl_path: str = "/sys/class/powercap/intel-rapl",
+        ram_coeff: float = 0.375,
+        ssd_coeff: float = 2.0,
+        other_coeff: float = 5.0,
+        gpu_ids: Optional[List[int]] = None,
+        per_gpu_log: bool = True,
+    ) -> None:
+        self.poll_interval = poll_interval
+        self.rapl_path = rapl_path
+        self.ram_coeff = ram_coeff
+        self.ssd_coeff = ssd_coeff
+        self.other_coeff = other_coeff
+        self.per_gpu_log = per_gpu_log
 
-    def _read_gpu_watts(self) -> float:
+        # Resolve which GPU indices to monitor
+        self._gpu_ids: List[int] = self._resolve_gpu_ids(gpu_ids)
+
+        # Accumulated samples
+        self._samples: List[float] = []                        # total system power (W)
+        self._gpu_samples: Dict[int, List[float]] = {          # per-GPU (W)
+            gid: [] for gid in self._gpu_ids
+        }
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        # Energy counters (kWh)
+        self.total_energy_kwh: float = 0.0
+        self.gpu_energy_kwh: Dict[int, float] = {gid: 0.0 for gid in self._gpu_ids}
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_gpu_ids(requested: Optional[List[int]]) -> List[int]:
+        """Return validated GPU indices, falling back to all visible devices."""
         try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=power.draw",
-                 "--format=csv,noheader,nounits"],
-                timeout=3
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5
             )
-            return sum(float(x) for x in out.decode().strip().split("\n"))
+            available = [int(x.strip()) for x in result.stdout.strip().splitlines()]
         except Exception:
-            return 0.0
+            available = []
 
-    def _read_cpu_watts(self) -> float:
-        rapl = Path(self.cfg.power.rapl_path)
+        if not available:
+            return []
+        if not requested:
+            return available
+        return [g for g in requested if g in available]
+
+    def _read_rapl_watts(self) -> float:
+        """Read CPU package power from Intel RAPL sysfs. Returns 0.0 on failure."""
         total = 0.0
         try:
-            for pkg in rapl.glob("intel-rapl:*"):
-                energy_file = pkg / "energy_uj"
-                if energy_file.exists():
-                    e1 = int(energy_file.read_text())
-                    time.sleep(0.1)
-                    e2 = int(energy_file.read_text())
-                    total += max(0, (e2 - e1)) / 1e6 / 0.1  # W
+            import os
+            for entry in os.scandir(self.rapl_path):
+                name_file = os.path.join(entry.path, "name")
+                energy_file = os.path.join(entry.path, "energy_uj")
+                if not (os.path.exists(name_file) and os.path.exists(energy_file)):
+                    continue
+                with open(name_file) as f:
+                    name = f.read().strip()
+                if "package" not in name:
+                    continue
+                with open(energy_file) as f:
+                    uj1 = int(f.read().strip())
+                time.sleep(0.1)
+                with open(energy_file) as f:
+                    uj2 = int(f.read().strip())
+                total += max(0, uj2 - uj1) / 1e5  # µJ over 0.1 s → W
         except Exception:
             pass
         return total
 
-    def _read_ram_watts(self) -> float:
+    def _read_gpu_watts(self) -> Dict[int, float]:
+        """
+        Query nvidia-smi for instantaneous power draw of each monitored GPU.
+
+        Returns a dict {gpu_id: watts}. Missing entries default to 0.0.
+        """
+        result: Dict[int, float] = {gid: 0.0 for gid in self._gpu_ids}
+        if not self._gpu_ids:
+            return result
+        try:
+            output = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,power.draw",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True, text=True, timeout=5
+            ).stdout.strip()
+
+            for line in output.splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 2:
+                    continue
+                try:
+                    gid = int(parts[0])
+                    watts = float(parts[1])
+                    if gid in result:
+                        result[gid] = watts
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+        return result
+
+    def _estimate_system_overhead(self) -> float:
+        """Estimate non-GPU, non-CPU power (RAM + SSD + board)."""
         try:
             import psutil
-            mem = psutil.virtual_memory()
-            used_gb = mem.used / (1024 ** 3)
-            return used_gb * self.cfg.power.ram_coeff
+            ram_gb = psutil.virtual_memory().total / 1e9
         except Exception:
-            return 0.0
+            ram_gb = 8.0
+        return ram_gb * self.ram_coeff + self.ssd_coeff + self.other_coeff
 
-    def _poll(self):
-        pc = self.cfg.power
-        while not self._stop.is_set():
-            gpu = self._read_gpu_watts()
-            cpu = self._read_cpu_watts()
-            ram = self._read_ram_watts()
-            other = pc.ssd_coeff + pc.other_coeff
-            total = gpu + cpu + ram + other
-            self.readings.append(total)
-            time.sleep(pc.poll_interval_sec)
+    # ── main loop ─────────────────────────────────────────────────────────────
+
+    def _poll(self) -> None:
+        """Background polling loop — runs in a daemon thread."""
+        while not self._stop_event.is_set():
+            cpu_w = self._read_rapl_watts()
+            gpu_w = self._read_gpu_watts()
+            overhead_w = self._estimate_system_overhead()
+
+            total_gpu_w = sum(gpu_w.values())
+            total_w = cpu_w + total_gpu_w + overhead_w
+
+            with self._lock:
+                self._samples.append(total_w)
+                for gid, w in gpu_w.items():
+                    self._gpu_samples[gid].append(w)
+
+                # Accumulate energy: P(W) × interval(h) = Wh
+                kwh_increment = total_w * self.poll_interval / 3_600_000
+                self.total_energy_kwh += kwh_increment
+                for gid, w in gpu_w.items():
+                    self.gpu_energy_kwh[gid] += w * self.poll_interval / 3_600_000
+
+            self._stop_event.wait(self.poll_interval)
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Start background power monitoring thread."""
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True, name="PowerMonitor")
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop monitoring thread and wait for it to finish."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.poll_interval + 2)
+
+    def summary(self) -> Dict:
+        """
+        Return a summary dict with total and per-GPU statistics.
+
+        Keys
+        ----
+        mean_power_w        : float — average total system power
+        total_energy_kwh    : float — total energy consumed
+        total_co2_kg        : float — CO₂ estimate (0.494 kg/kWh, EU avg)
+        num_gpus_monitored  : int
+        gpu_ids             : list[int]
+        per_gpu             : dict[int, dict] — per-GPU mean_w and energy_kwh
+        """
+        with self._lock:
+            samples = list(self._samples)
+            gpu_samples = {gid: list(v) for gid, v in self._gpu_samples.items()}
+            total_energy = self.total_energy_kwh
+            gpu_energy = dict(self.gpu_energy_kwh)
+
+        mean_total = sum(samples) / len(samples) if samples else 0.0
+        co2_kg = total_energy * 0.494  # IPCC/IEA grid average
+
+        per_gpu: Dict[int, Dict] = {}
+        if self.per_gpu_log:
+            for gid in self._gpu_ids:
+                s = gpu_samples.get(gid, [])
+                per_gpu[gid] = {
+                    "mean_power_w": sum(s) / len(s) if s else 0.0,
+                    "energy_kwh": gpu_energy.get(gid, 0.0),
+                    "co2_kg": gpu_energy.get(gid, 0.0) * 0.494,
+                }
+
+        return {
+            "mean_power_w": mean_total,
+            "total_energy_kwh": total_energy,
+            "total_co2_kg": co2_kg,
+            "num_gpus_monitored": len(self._gpu_ids),
+            "gpu_ids": list(self._gpu_ids),
+            "per_gpu": per_gpu,
+        }
+
+    def log_summary(self, logger=None) -> None:
+        """Print (or log) a human-readable power summary."""
+        s = self.summary()
+        lines = [
+            "─" * 52,
+            f"  Power & Energy Summary",
+            f"  Mean system power  : {s['mean_power_w']:.1f} W",
+            f"  Total energy       : {s['total_energy_kwh']:.4f} kWh",
+            f"  Estimated CO₂      : {s['total_co2_kg']:.4f} kg",
+            f"  GPUs monitored     : {s['num_gpus_monitored']} {s['gpu_ids']}",
+        ]
+        for gid, info in s["per_gpu"].items():
+            lines.append(
+                f"    GPU {gid}: {info['mean_power_w']:.1f} W avg, "
+                f"{info['energy_kwh']:.4f} kWh, {info['co2_kg']:.4f} kg CO₂"
+            )
+        lines.append("─" * 52)
+        msg = "\n".join(lines)
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -300,19 +494,34 @@ class MTLDataset(Dataset):
         frames = []
         for fp in frame_paths:
             img = self._load_frame(fp)
-            aug = self.transform(image=img)["image"]   # C,H,W tensor
+            aug = self.transform(image=img)["image"]
             frames.append(aug)
 
-        # Stack: (T, C, H, W)
         frames_tensor = torch.stack(frames, dim=0)
 
+        # ── Task-specific labels ──────────────────────────────────
+        task = clip["task"]
+        binary_label = clip["label"]  # 0=real/live, 1=fake/spoof
+        
+        if task == "deepfake":
+            deepfake_label = binary_label
+            spoof_label = 0  # placeholder
+        else:  # anti-spoof
+            deepfake_label = 0  # placeholder
+            spoof_label = binary_label
+
+        temporal_label = binary_label  # temporal
+
         return {
-            "frames": frames_tensor,                   # (T,C,H,W)
-            "label": torch.tensor(clip["label"], dtype=torch.long),
-            "task": clip["task"],                      # "deepfake" | "anti-spoof"
+            "frames": frames_tensor,
+            "deepfake_label": torch.tensor(deepfake_label, dtype=torch.long),
+            "spoof_label": torch.tensor(spoof_label, dtype=torch.long),
+            "temporal_label": torch.tensor(temporal_label, dtype=torch.long),
+            "task": task,
             "dataset": clip["dataset"],
-            "video_path": clip["video_path"],
+            "video_id": clip["video_path"],  # video_path 
         }
+
 
 
 def build_interleaved_loader(
@@ -434,27 +643,119 @@ class AntiSpoofHead(nn.Module):
 
 class TemporalHead(nn.Module):
     """
-    Temporal consistency head.
-    Projects per-frame features then measures inter-frame consistency.
+    Redesigned temporal consistency head with explicit supervision.
+
+    Supports three modes:
+      - 'pseudo_label':  binary label from mean of adjacent deepfake predictions
+      - 'optical_flow':  consistency score from precomputed optical flow
+      - 'combined':      both pseudo-label + flow auxiliary loss (recommended)
+
+    Args:
+        feature_dim:    backbone output dimension (e.g. 1408 for EfficientNet-B2)
+        proj_dim:       temporal projection dimension
+        hidden_dim:     classifier hidden dimension
+        dropout:        dropout probability
+        supervision:    'pseudo_label' | 'optical_flow' | 'combined'
+        flow_channels:  optical flow channels (2 = dx, dy)
     """
 
-    def __init__(self, in_dim: int, hidden: int, dropout: float):
+    def __init__(
+        self,
+        feature_dim: int = 1408,
+        proj_dim: int = 128,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+        supervision: str = "combined",
+        flow_channels: int = 2,
+    ) -> None:
         super().__init__()
+        self.supervision = supervision
+
+        # ── Per-frame temporal projection ────────────────────────────────────
         self.proj = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+            nn.Linear(feature_dim, proj_dim),
+            nn.LayerNorm(proj_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(proj_dim, proj_dim),
+        )
+
+        # ── Temporal classifier (for pseudo-label supervision) ──────────────
+        self.clf = nn.Sequential(
+            nn.Linear(proj_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
+            nn.Linear(hidden_dim, 1),
         )
-        self.clf = nn.Linear(hidden, 1)  # for binary supervision
 
-    def forward(self, feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # feats: (B, T, D)
-        proj = self.proj(feats)                        # (B, T, H)
-        # Mean-pooled representation for classification
-        pooled = proj.mean(dim=1)                      # (B, H)
-        logit = self.clf(pooled).squeeze(-1)           # (B,)
-        return proj, logit
+        # ── Optical flow encoder (optional) ──────────────────────────────────
+        if supervision in ("optical_flow", "combined"):
+            # Lightweight CNN to encode (T-1, flow_channels, H, W) → scalar
+            self.flow_encoder = nn.Sequential(
+                nn.Conv2d(flow_channels, 32, kernel_size=3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((4, 4)),
+                nn.Flatten(),
+                nn.Linear(32 * 4 * 4, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, 1),   # flow consistency score per pair
+            )
+        else:
+            self.flow_encoder = None
+
+    def forward(
+        self,
+        feats: torch.Tensor,
+        df_logits: Optional[torch.Tensor] = None,
+        flow: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """
+        Args:
+            feats:     (B, T, D)  per-frame backbone features
+            df_logits: (B, T)     per-frame deepfake logits (for pseudo-label)
+            flow:      (B, T-1, 2, H, W) optical flow between consecutive frames
+
+        Returns:
+            dict with:
+              - 'temp_proj':         (B, T, proj_dim) per-frame projections
+              - 'temp_logit':        (B,)             temporal binary logit
+              - 'pseudo_label':      (B,)             soft pseudo-label (detached)
+              - 'flow_consistency':  (B,)             flow score (if flow given)
+        """
+        B, T, D = feats.shape
+
+        # ── 1. Project per-frame features ─────────────────────────────────────
+        proj = self.proj(feats)        # (B, T, proj_dim)
+        pooled = proj.mean(dim=1)      # (B, proj_dim)
+        temp_logit = self.clf(pooled).squeeze(-1)  # (B,)
+
+        output = {
+            "temp_proj": proj,
+            "temp_logit": temp_logit,
+            "pseudo_label": None,
+            "flow_consistency": None,
+        }
+
+        # ── 2. Pseudo-label from adjacent deepfake predictions ─────────────────
+        if df_logits is not None and self.supervision in ("pseudo_label", "combined"):
+            # df_logits: (B, T) — average over adjacent frames (±1 window)
+            df_probs = torch.sigmoid(df_logits.detach())  # (B, T), no grad
+            # Smooth label: mean over all frames per sample
+            pseudo = df_probs.mean(dim=1)  # (B,) — soft target in [0, 1]
+            output["pseudo_label"] = pseudo
+
+        # ── 3. Optical flow consistency ────────────────────────────────────────
+        if flow is not None and self.flow_encoder is not None:
+            # flow: (B, T-1, 2, H, W) → process each pair, average score
+            B, Tm1, C, H, W = flow.shape
+            flow_flat = flow.view(B * Tm1, C, H, W)          # (B*(T-1), 2, H, W)
+            scores = self.flow_encoder(flow_flat)              # (B*(T-1), 1)
+            scores = scores.view(B, Tm1).mean(dim=1)           # (B,)
+            output["flow_consistency"] = scores
+
+        return output
+
 
 
 class MTLModel(nn.Module):
@@ -483,7 +784,12 @@ class MTLModel(nn.Module):
         # Task heads
         self.deepfake_head = DeepfakeHead(feat_dim, mc.deepfake_hidden, mc.dropout)
         self.spoof_head = AntiSpoofHead(feat_dim, mc.spoof_hidden, mc.dropout)
-        self.temporal_head = TemporalHead(feat_dim, mc.temporal_hidden, mc.dropout)
+        self.temporal_head = TemporalHead(
+            feature_dim=feat_dim,
+            proj_dim=mc.temporal_hidden,
+            dropout=mc.dropout
+        )
+
 
         # GradNorm learnable log-weights
         self.log_weights = nn.Parameter(torch.zeros(3))  # [df, spoof, temp]
@@ -492,6 +798,13 @@ class MTLModel(nn.Module):
     def task_weights(self) -> torch.Tensor:
         """Softmax-normalized task weights from GradNorm parameters."""
         return F.softmax(self.log_weights, dim=0) * 3   # scale to sum~3
+
+    @task_weights.setter
+    def task_weights(self, weights: torch.Tensor) -> None:
+        """Set log_weights from desired positive task weights."""
+        with torch.no_grad():
+            self.log_weights.copy_(torch.log(weights / weights.mean()))
+
 
     def forward(
         self,
@@ -771,572 +1084,955 @@ class ResultLogger:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Early Stopping
+# ──────────────────────────────────────────────────────────────────────────────
+class EarlyStopping:
+    """
+    Monitors a validation metric and signals when training should stop.
+
+    Supports both 'max' (e.g. AUC) and 'min' (e.g. ACER) modes.
+
+    Args:
+        patience:   number of epochs to wait after last improvement
+        min_delta:  minimum change to qualify as an improvement
+        mode:       'max' to maximize metric, 'min' to minimize
+        metric_key: name of the metric in the val_metrics dict (for logging)
+    """
+
+    def __init__(
+        self,
+        patience: int = 7,
+        min_delta: float = 1e-4,
+        mode: str = "max",
+        metric_key: str = "primary",
+    ) -> None:
+        assert mode in ("max", "min"), "mode must be 'max' or 'min'"
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.metric_key = metric_key
+
+        self.best_value: float = float("-inf") if mode == "max" else float("inf")
+        self.epochs_without_improvement: int = 0
+        self.should_stop: bool = False
+
+    def _is_improvement(self, current: float) -> bool:
+        if self.mode == "max":
+            return current > self.best_value + self.min_delta
+        return current < self.best_value - self.min_delta
+
+    def step(self, current_value: float) -> bool:
+        """
+        Update state with the latest metric value.
+
+        Args:
+            current_value: metric value for the current epoch
+
+        Returns:
+            True if training should stop, False otherwise.
+        """
+        if self._is_improvement(current_value):
+            self.best_value = current_value
+            self.epochs_without_improvement = 0
+        else:
+            self.epochs_without_improvement += 1
+
+        if self.epochs_without_improvement >= self.patience:
+            self.should_stop = True
+
+        return self.should_stop
+
+    def state_dict(self) -> dict:
+        return {
+            "best_value": self.best_value,
+            "epochs_without_improvement": self.epochs_without_improvement,
+            "should_stop": self.should_stop,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.best_value = state["best_value"]
+        self.epochs_without_improvement = state["epochs_without_improvement"]
+        self.should_stop = state["should_stop"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # GradNorm
 # ──────────────────────────────────────────────────────────────────────────────
-
 class GradNormManager:
     """
-    GradNorm: adjusts task loss weights so all tasks train at similar speed.
-    Reference: Chen et al., 2018.
+    GradNorm: Gradient Normalization for Adaptive Loss Balancing.
+
+    Reference: Chen et al., "GradNorm: Gradient Normalization for
+    Adaptive Loss Balancing in Deep Multitask Networks", ICML 2018.
+
+    Maintains learnable task weights and updates them so that each task's
+    gradient norm matches a target proportional to the task's training speed.
+
+    Args:
+        num_tasks:    number of tasks (3: deepfake, spoof, temporal)
+        alpha:        asymmetry hyperparameter (higher → more aggressive rebalancing)
+        lr:           learning rate for task-weight optimizer
+        device:       torch device
+        init_weights: initial task weights [w_deepfake, w_spoof, w_temporal]
     """
 
-    def __init__(self, model: MTLModel, alpha: float, lr: float):
-        """Initialize with model, alpha (asymmetry), and weight LR."""
-        self.model = model
+    def __init__(
+        self,
+        num_tasks: int,
+        alpha: float = 1.5,
+        lr: float = 1e-3,
+        device: torch.device = torch.device("cpu"),
+        init_weights: Optional[List[float]] = None,
+    ) -> None:
+        self.num_tasks = num_tasks
         self.alpha = alpha
+        self.device = device
+
+        # Log-scale weights to ensure positivity
+        if init_weights is None:
+            init_weights = [1.0] * num_tasks
+        log_init = [float(np.log(max(w, 1e-6))) for w in init_weights]
+        
+        self.log_weights = nn.Parameter(
+            torch.tensor(log_init, dtype=torch.float32, device=device),
+            requires_grad=True,
+        )
+        self.optimizer = torch.optim.Adam([self.log_weights], lr=lr)
+
+        # Initial losses — set on first update call
         self.initial_losses: Optional[torch.Tensor] = None
-        self.optimizer = torch.optim.Adam([model.log_weights], lr=lr)
+        self._update_count = 0
+
+    @property
+    def weights(self) -> torch.Tensor:
+        """Current task weights (positive, unnormalized)."""
+        w = torch.exp(self.log_weights)
+        # Normalize around mean=1.0 for numerical stability
+        return w * self.num_tasks / w.sum()
 
     def update(
         self,
-        losses: torch.Tensor,          # (3,) current task losses
-        shared_params: List[torch.Tensor],
-    ) -> None:
-        """One GradNorm update step."""
+        losses: torch.Tensor,
+        shared_params: List[nn.Parameter],
+    ) -> torch.Tensor:
+        """
+        Compute GradNorm loss and update task weights.
+
+        Args:
+            losses:         (num_tasks,) tensor of per-task losses
+            shared_params:  list of backbone parameters with requires_grad=True
+
+        Returns:
+            normalized_weights: (num_tasks,) summing to num_tasks (for logging)
+        """
+        self._update_count += 1
+
+        # 1. Store initial losses on first call
         if self.initial_losses is None:
-            self.initial_losses = losses.detach()
+            self.initial_losses = losses.detach().clone()
+            # Return current weights without update
+            return self.weights.detach()
 
-        weights = self.model.task_weights                  # (3,)
-        weighted_losses = weights * losses
+        # 2. Filter only trainable shared params
+        trainable_shared = [p for p in shared_params if p.requires_grad]
+        if not trainable_shared:
+            return self.weights.detach()
 
-        # Gradient norms
-        G_norms = []
-        for wl in weighted_losses:
+        # 3. Get current task weights
+        weights = self.weights
+
+        # 4. Compute per-task gradient norms w.r.t. shared backbone
+        #    This is expensive: one backward pass per task
+        norms = []
+        for i in range(self.num_tasks):
+            # Gradient of weighted task loss w.r.t. backbone
             grads = torch.autograd.grad(
-                wl, shared_params, retain_graph=True, allow_unused=True
+                outputs=losses[i] * weights[i],
+                inputs=trainable_shared,
+                retain_graph=True,
+                create_graph=True,  # needed to backprop through norm
+                allow_unused=True,
             )
-            g_flat = torch.cat([
-                g.view(-1) for g in grads if g is not None
-            ])
-            G_norms.append(g_flat.norm())
+            # Compute L2 norm of gradients
+            grad_norms = [g.norm(2) for g in grads if g is not None]
+            if grad_norms:
+                task_norm = torch.stack(grad_norms).norm(2)
+            else:
+                task_norm = torch.tensor(0.0, device=self.device)
+            norms.append(task_norm)
+        
+        norms = torch.stack(norms)  # (num_tasks,)
 
-        G_norms = torch.stack(G_norms)                    # (3,)
-        G_mean = G_norms.mean().detach()
+        # 5. Compute loss ratios: L_i(t) / L_i(0)
+        loss_ratios = losses.detach() / (self.initial_losses + 1e-8)
 
-        # Relative inverse training rates
-        loss_ratio = losses.detach() / (self.initial_losses + 1e-8)
-        loss_ratio_mean = loss_ratio.mean()
-        ri = loss_ratio / (loss_ratio_mean + 1e-8)
+        # 6. Compute target gradient norms
+        #    target_i = mean_norm × r_i^alpha
+        mean_norm = norms.mean().detach()
+        target_norms = mean_norm * (loss_ratios ** self.alpha)
 
-        # GradNorm targets
-        G_targets = (G_mean * ri ** self.alpha).detach()
+        # 7. GradNorm loss: L1 distance between actual and target norms
+        gn_loss = F.l1_loss(norms, target_norms.detach())
 
-        # GradNorm loss
-        gn_loss = (G_norms - G_targets).abs().sum()
-
+        # 8. Update log_weights
         self.optimizer.zero_grad()
-        gn_loss.backward(retain_graph=True)
+        gn_loss.backward()
         self.optimizer.step()
 
-        # Renormalize weights
+        # 9. Re-normalize weights around mean=1.0 (cosmetic, for stability)
         with torch.no_grad():
-            self.model.log_weights.data = (
-                self.model.log_weights - self.model.log_weights.mean()
-            )
+            w = torch.exp(self.log_weights)
+            self.log_weights.data = torch.log(w * self.num_tasks / w.sum())
+
+        return self.weights.detach()
+
+    def state_dict(self) -> dict:
+        return {
+            "log_weights": self.log_weights.data.cpu(),
+            "initial_losses": self.initial_losses.cpu() if self.initial_losses is not None else None,
+            "update_count": self._update_count,
+            "optimizer": self.optimizer.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.log_weights.data = state["log_weights"].to(self.device)
+        if state["initial_losses"] is not None:
+            self.initial_losses = state["initial_losses"].to(self.device)
+        self._update_count = state.get("update_count", 0)
+        self.optimizer.load_state_dict(state["optimizer"])
+
+
+# ─── REPLACE pcgrad_step function در train.py:571-598 ───────────────────────
+
+def pcgrad_step(
+    losses: List[torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    retain_graph: bool = False,
+) -> None:
+    """
+    PCGrad: Project Conflicting Gradients.
+
+    Reference: Yu et al., "Gradient Surgery for Multi-Task Learning", NeurIPS 2020.
+
+    Computes gradient for each task, projects conflicting gradients onto
+    the normal plane, and applies the conflict-free combined gradient.
+
+    Args:
+        losses:       list of K task-specific scalar losses
+        optimizer:    the model optimizer (e.g. AdamW)
+        retain_graph: whether to keep computation graph after backward
+    """
+    num_tasks = len(losses)
+    
+    # 1. Collect parameters from optimizer
+    params = []
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if p.requires_grad:
+                params.append(p)
+    
+    if not params:
+        return
+
+    # 2. Compute per-task gradients
+    task_grads = []
+    for i, loss in enumerate(losses):
+        optimizer.zero_grad()
+        loss.backward(retain_graph=True)
+        
+        # Flatten gradients into a single vector
+        grad_vec = []
+        for p in params:
+            if p.grad is not None:
+                grad_vec.append(p.grad.data.flatten().clone())
+            else:
+                grad_vec.append(torch.zeros(p.numel(), device=p.device, dtype=p.dtype))
+        task_grads.append(torch.cat(grad_vec))
+
+    # 3. Project conflicting gradients
+    #    For each pair (i, j): if dot(g_i, g_j) < 0, project g_i
+    pc_grads = [g.clone() for g in task_grads]
+
+    for i in range(num_tasks):
+        for j in range(num_tasks):
+            if i == j:
+                continue
+            dot_product = torch.dot(pc_grads[i], task_grads[j])
+            if dot_product < 0:
+                # Project g_i onto plane normal to g_j
+                proj_component = dot_product / (task_grads[j].norm() ** 2 + 1e-8)
+                pc_grads[i] = pc_grads[i] - proj_component * task_grads[j]
+
+    # 4. Average projected gradients
+    final_grad = torch.stack(pc_grads).mean(dim=0)
+
+    # 5. Assign back to parameters
+    optimizer.zero_grad()
+    idx = 0
+    for p in params:
+        num_elem = p.numel()
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+        p.grad.data = final_grad[idx : idx + num_elem].view_as(p)
+        idx += num_elem
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Trainer
 # ──────────────────────────────────────────────────────────────────────────────
-
 class Trainer:
-    """Main training loop for MTL model."""
+    """Main training loop for MTL deepfake/anti-spoof model."""
 
-    def __init__(self, cfg: Config, logger: logging.Logger):
-        """Initialize all training components."""
-        self.cfg = cfg
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    def __init__(self, cfg: Config, logger: logging.Logger) -> None:
+        self.cfg    = cfg
         self.logger = logger
-        # self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-        self.device = torch.device("cpu")
-        self.current_batch_size = cfg.train.batch_size
+        tc = cfg.train
+        mc = cfg.model
 
-        # Paths
-        ckpt_root = cfg.paths.checkpoint_dir
-        os.makedirs(ckpt_root, exist_ok=True)
+        # ── Device ────────────────────────────────────────────────────
+        self.device = self._resolve_device(tc)
 
-        if cfg.resume:
-            last = get_last_run_id(ckpt_root)
-            if last and os.path.exists(os.path.join(ckpt_root, last, "last.pth")):
-                self.run_id = last
-                logger.info(f"Resuming from {last}")
-            else:
-                self.run_id = get_next_run_id(ckpt_root)
-                logger.info(f"Starting new run: {self.run_id}")
-        else:
-            self.run_id = get_next_run_id(ckpt_root)
-
+        # ── Run ID & directories ──────────────────────────────────────
+        ckpt_root   = cfg.paths.checkpoint_dir
+        self.run_id = self._get_run_id(tc.resume, ckpt_root)
         self.run_dir = os.path.join(ckpt_root, self.run_id)
         os.makedirs(self.run_dir, exist_ok=True)
+        self.logger.info(f"Run directory: {self.run_dir}")
 
-        # Model
-        self.model = MTLModel(cfg).to(self.device)
-        self._log_model_info()
-
-        # Losses
-        self.criterion_df = nn.BCEWithLogitsLoss()
-        self.criterion_spoof = FocalLoss(cfg.train.focal_gamma, cfg.train.focal_alpha)
-
-        # Optimizer (two param groups: heads + backbone)
-        backbone_params = list(self.model.backbone.parameters())
-        head_params = (
-            list(self.model.deepfake_head.parameters()) +
-            list(self.model.spoof_head.parameters()) +
-            list(self.model.temporal_head.parameters())
+        self.result_logger = ResultLogger(
+            os.path.join(self.run_dir, cfg.paths.result_csv)
         )
-        self.optimizer = torch.optim.AdamW([
-            {"params": head_params, "lr": cfg.train.lr},
-            {"params": backbone_params, "lr": cfg.train.lr * cfg.model.backbone_lr_scale},
-        ], weight_decay=cfg.train.weight_decay, betas=cfg.train.betas)
 
-        # Scheduler
+        # ── Model ─────────────────────────────────────────────────────
+        self.model = self._build_model()
+
+        # ── Multi-GPU ─────────────────────────────────────────────────
+        self.use_multi_gpu = False
+        self.gpu_ids = (
+            tc.gpu_ids if tc.gpu_ids
+            else list(range(torch.cuda.device_count()))
+        )
+        if tc.use_data_parallel and self.device.type == "cuda" and len(self.gpu_ids) > 1:
+            self.use_multi_gpu = True
+            self.model = nn.DataParallel(self.model, device_ids=self.gpu_ids)
+            self.logger.info(f"DataParallel on GPUs: {self.gpu_ids}")
+
+        # ── Loss functions ────────────────────────────────────────────
+        self.criterion_df = nn.BCEWithLogitsLoss()
+        self.criterion_sp = FocalLoss(gamma=tc.focal_gamma, alpha=tc.focal_alpha)
+
+        # ── Optimizer (differential LR for backbone vs heads) ─────────
+        base_model   = self.model.module if self.use_multi_gpu else self.model
+        head_params  = (
+            list(base_model.deepfake_head.parameters()) +
+            list(base_model.spoof_head.parameters())    +
+            list(base_model.temporal_head.parameters())
+        )
+        backbone_params = list(base_model.backbone.parameters())
+        self.optimizer = torch.optim.AdamW(
+            [
+                {"params": head_params,     "lr": tc.lr},
+                {"params": backbone_params, "lr": tc.lr * mc.backbone_lr_scale},
+            ],
+            weight_decay=tc.weight_decay,
+        )
+
+        # ── AMP ───────────────────────────────────────────────────────
+        self.use_amp = (self.device.type == "cuda") and (tc.amp_dtype in ("float16", "bfloat16"))
+        if self.use_amp:
+            _dtype         = torch.float16 if tc.amp_dtype == "float16" else torch.bfloat16
+            self.scaler    = torch.cuda.amp.GradScaler(enabled=True)
+            self.autocast_ctx = torch.cuda.amp.autocast(dtype=_dtype)
+            self.logger.info(f"AMP enabled  dtype={tc.amp_dtype}")
+        else:
+            self.scaler       = torch.cuda.amp.GradScaler(enabled=False)
+            self.autocast_ctx = contextlib.nullcontext()
+
+        # ── GradNorm ──────────────────────────────────────────────────
+        self.use_gradnorm = tc.use_gradnorm
+        if self.use_gradnorm:
+            init_w = [tc.w_deepfake, tc.w_spoof, tc.w_temporal]
+            self.gradnorm_manager = GradNormManager(
+                num_tasks=3,
+                alpha=tc.gradnorm_alpha,
+                lr=1e-3,
+                device=self.device,
+                init_weights=init_w,
+            )
+            base_model.task_weights = self.gradnorm_manager.weights
+            self.logger.info("GradNorm enabled.")
+        else:
+            self.gradnorm_manager = None
+
+        # ── PCGrad ────────────────────────────────────────────────────
+        self.use_pcgrad = tc.use_pcgrad
+        if self.use_pcgrad:
+            self.logger.info("PCGrad enabled.")
+
+        # ── Scheduler (with optional linear warmup) ───────────────────
         self.scheduler = self._build_scheduler()
-        self.scaler = GradScaler(enabled=cfg.train.use_amp and self.device.type == "cuda")
 
-        # GradNorm
-        self.gradnorm = None
-        if cfg.train.use_gradnorm:
-            self.gradnorm = GradNormManager(
-                self.model, cfg.train.gradnorm_alpha, lr=1e-3
+        # ── Early stopping ────────────────────────────────────────────
+        self.early_stopping: Optional[EarlyStopping] = None
+        if tc.use_early_stopping:
+            self.early_stopping = EarlyStopping(
+                patience=tc.early_stopping_patience,
+                min_delta=tc.early_stopping_min_delta,
+                mode=tc.early_stopping_mode,
+                metric_key=tc.early_stopping_metric,
+            )
+            self.logger.info(
+                f"Early stopping: metric={tc.early_stopping_metric}  "
+                f"mode={tc.early_stopping_mode}  "
+                f"patience={tc.early_stopping_patience}"
             )
 
-        # Result CSV
-        result_path = os.path.join(self.run_dir, cfg.paths.result_csv)
-        self.result_logger = ResultLogger(result_path)
-
-        # State
-        self.start_epoch = 0
-        self.best_metric = -float("inf")
-        self.best_epoch = 0
-
-        # Load checkpoint if resuming
-        if cfg.resume:
-            self._load_checkpoint()
-
-    def _log_model_info(self) -> None:
-        """Log model parameter count."""
-        total = sum(p.numel() for p in self.model.parameters())
-        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self.logger.info(
-            f"Model: {self.cfg.model.backbone} | "
-            f"Total params: {total/1e6:.2f}M | Trainable: {trainable/1e6:.2f}M"
+        # ── Power monitor ─────────────────────────────────────────────
+        pc = cfg.power
+        self.power_monitor = PowerMonitor(
+            poll_interval=pc.poll_interval_sec,
+            rapl_path=pc.rapl_path,
+            ram_coeff=pc.ram_coeff,
+            ssd_coeff=pc.ssd_coeff,
+            other_coeff=pc.other_coeff,
+            gpu_ids=(pc.gpu_ids if pc.gpu_ids else self.gpu_ids) if pc.monitor_all_gpus else [],
+            per_gpu_log=pc.per_gpu_log,
         )
+
+        # ── Mutable state ─────────────────────────────────────────────
+        self.start_epoch  = 0
+        self.best_metric  = -float("inf")
+        self.best_epoch   = 0
+        self.history: List[Dict] = []          # kept in-memory; persisted via _save_history
+        self.current_batch_size = tc.batch_size
+
+        self._load_checkpoint()
+
+    # ------------------------------------------------------------------
+    # Device resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_device(self, tc) -> torch.device:
+        """
+        Resolve the training device from cfg.train.device.
+        Falls back to CPU if CUDA is unavailable and fallback_to_cpu=True.
+        """
+        requested = tc.device  # e.g. "cuda", "cuda:0", "cuda:0,1", "cpu"
+
+        if requested.startswith("cuda"):
+            if torch.cuda.is_available():
+                # Use only the primary device for .to(); DataParallel handles the rest
+                primary = requested.split(",")[0]
+                device  = torch.device(primary)
+                self.logger.info(
+                    f"Device: {device}  |  GPUs available: {torch.cuda.device_count()}"
+                )
+                return device
+            if tc.fallback_to_cpu:
+                self.logger.warning(
+                    "CUDA requested but unavailable — falling back to CPU."
+                )
+                return torch.device("cpu")
+            raise RuntimeError(
+                "CUDA requested but not available, and fallback_to_cpu=False."
+            )
+
+        return torch.device("cpu")
+
+    # ------------------------------------------------------------------
+    # Model building
+    # ------------------------------------------------------------------
+
+    def _build_model(self) -> nn.Module:
+        model = MTLModel(self.cfg).to(self.device)
+        self.logger.info(f"Backbone features: {model.backbone.num_features}")
+        self._log_model_info(model)
+        return model
+
+
+    def _log_model_info(self, model: Optional[nn.Module] = None) -> None:
+        """Log total and trainable parameter counts."""
+        m = model if model is not None else (
+            self.model.module if self.use_multi_gpu else self.model
+        )
+        total     = sum(p.numel() for p in m.parameters())
+        trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        self.logger.info(
+            f"Parameters — total: {total:,}  trainable: {trainable:,}"
+        )
+
+    # ------------------------------------------------------------------
+    # Scheduler
+    # ------------------------------------------------------------------
 
     def _build_scheduler(self):
-        """Build LR scheduler based on config."""
+        """
+        Build the LR scheduler.
+        If cfg.train.warmup_epochs > 0, wraps the main scheduler with
+        a linear warmup using SequentialLR.
+        """
         tc = self.cfg.train
+
+        # ── Main scheduler ────────────────────────────────────────────
         if tc.scheduler == "cosine":
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=tc.num_epochs, eta_min=tc.min_lr
+            main_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=tc.num_epochs - tc.warmup_epochs,
+                eta_min=tc.min_lr,
             )
         elif tc.scheduler == "step":
-            return torch.optim.lr_scheduler.StepLR(
-                self.optimizer, step_size=tc.step_size, gamma=tc.gamma
+            main_sched = torch.optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=tc.step_size,
+                gamma=tc.gamma,
             )
         else:
-            return torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode="max", patience=5, factor=0.5
+            main_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="max",
+                patience=5,
+                factor=0.5,
+                min_lr=tc.min_lr,
             )
+            # ReduceLROnPlateau doesn't support SequentialLR; apply warmup manually
+            if tc.warmup_epochs > 0:
+                self.logger.warning(
+                    "warmup_epochs is set but ReduceLROnPlateau is selected — "
+                    "warmup will be applied manually in fit()."
+                )
+            return main_sched
 
-    def _freeze_backbone(self, freeze: bool) -> None:
-        """Freeze or unfreeze backbone parameters."""
-        for p in self.model.backbone.parameters():
-            p.requires_grad = not freeze
-        state = "frozen" if freeze else "unfrozen"
-        self.logger.info(f"Backbone {state}.")
+        # ── Optional linear warmup ────────────────────────────────────
+        if tc.warmup_epochs > 0:
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=1e-4,
+                end_factor=1.0,
+                total_iters=tc.warmup_epochs,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_sched, main_sched],
+                milestones=[tc.warmup_epochs],
+            )
+            self.logger.info(
+                f"Scheduler: {tc.warmup_epochs}-epoch linear warmup → {tc.scheduler}"
+            )
+        else:
+            scheduler = main_sched
+            self.logger.info(f"Scheduler: {tc.scheduler}")
 
-    def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool) -> None:
-        """Save epoch checkpoint and optionally best model."""
+        return scheduler
+
+    # ------------------------------------------------------------------
+    # Checkpoint I/O
+    # ------------------------------------------------------------------
+
+    def _save_checkpoint(
+        self,
+        epoch: int,
+        metrics: Dict,
+        is_best: bool = False,
+    ) -> None:
+        """Save epoch checkpoint, always overwrite last.pth, optionally best.pth."""
         state = {
-            "epoch": epoch,
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
-            "scaler": self.scaler.state_dict(),
-            "best_metric": self.best_metric,
-            "best_epoch": self.best_epoch,
-            "metrics": metrics,
+            "epoch":        epoch,
+            "model":        self.model.state_dict(),
+            "optimizer":    self.optimizer.state_dict(),
+            "scheduler":    self.scheduler.state_dict(),
+            "scaler":       self.scaler.state_dict(),
+            "best_metric":  self.best_metric,
+            "best_epoch":   self.best_epoch,
+            "metrics":      metrics,
+            "history":      self.history,
         }
-        epoch_path = os.path.join(self.run_dir, f"epoch_{epoch:03d}.pth")
-        torch.save(state, epoch_path)
 
-        last_path = os.path.join(self.run_dir, "last.pth")
-        torch.save(state, last_path)
+        # Per-epoch snapshot (optional, controlled by cfg)
+        if self.cfg.train.save_every_epoch:
+            epoch_path = os.path.join(self.run_dir, f"epoch_{epoch:03d}.pth")
+            torch.save(state, epoch_path)
+
+        # Always keep the latest checkpoint
+        torch.save(state, os.path.join(self.run_dir, "last.pth"))
 
         if is_best:
-            best_path = os.path.join(self.run_dir, "best.pth")
-            torch.save(state, best_path)
-            self.logger.info(f"  [*] Best model saved at epoch {epoch}")
+            torch.save(state, os.path.join(self.run_dir, "best.pth"))
+            self.logger.info(f"  ★ New best checkpoint saved (epoch {epoch})")
 
     def _load_checkpoint(self) -> None:
-        """Load from last.pth if it exists."""
+        """Restore training state from last.pth if it exists in run_dir."""
         ckpt_path = os.path.join(self.run_dir, "last.pth")
         if not os.path.exists(ckpt_path):
             return
+
+        self.logger.info(f"Resuming from: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=self.device)
+
         self.model.load_state_dict(ckpt["model"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.scheduler.load_state_dict(ckpt["scheduler"])
+
+        # scheduler might not have state_dict for ReduceLROnPlateau in older saves
+        try:
+            self.scheduler.load_state_dict(ckpt["scheduler"])
+        except Exception:
+            self.logger.warning("Could not restore scheduler state.")
+
         self.scaler.load_state_dict(ckpt["scaler"])
         self.start_epoch = ckpt["epoch"] + 1
         self.best_metric = ckpt.get("best_metric", -float("inf"))
-        self.best_epoch = ckpt.get("best_epoch", 0)
+        self.best_epoch  = ckpt.get("best_epoch", 0)
+        self.history     = ckpt.get("history", [])
         self.logger.info(
-            f"Resumed from epoch {ckpt['epoch']} | best metric: {self.best_metric:.4f}"
+            f"Resumed at epoch {self.start_epoch}  |  best metric so far: {self.best_metric:.4f}"
         )
 
-    def _compute_task_losses(
-        self,
-        outputs: dict,
-        labels: torch.Tensor,
-        task_flags: torch.Tensor,   # 0=deepfake, 1=spoof
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute per-task losses with task masking."""
-        df_mask = (task_flags == 0)
-        sp_mask = (task_flags == 1)
+    # ------------------------------------------------------------------
+    # History persistence
+    # ------------------------------------------------------------------
 
-        loss_df = torch.tensor(0.0, device=self.device, requires_grad=True)
-        loss_sp = torch.tensor(0.0, device=self.device, requires_grad=True)
+    def _save_history(self) -> None:
+        """
+        Persist in-memory history list to a JSON file alongside the CSV.
+        Called at the end of every epoch so progress survives crashes.
+        """
+        import json
+        hist_path = os.path.join(self.run_dir, "history.json")
+        with open(hist_path, "w", encoding="utf-8") as f:
+            json.dump(self.history, f, indent=2, default=str)
 
-        if df_mask.sum() > 0:
-            loss_df = self.criterion_df(
-                outputs["df_logit"][df_mask],
-                labels[df_mask].float()
-            )
-        if sp_mask.sum() > 0:
-            loss_sp = self.criterion_spoof(
-                outputs["sp_logit"][sp_mask],
-                labels[sp_mask]
-            )
+    # ------------------------------------------------------------------
+    # Run-ID helpers
+    # ------------------------------------------------------------------
 
-        loss_temp = temporal_consistency_loss(
-            outputs["temp_proj"], labels
-        )
-        return loss_df, loss_sp, loss_temp
-
-    def _train_step(
-        self,
-        batch: dict,
-        accum_step: int,
-    ) -> dict:
-        """One gradient accumulation step. Returns loss dict."""
-        tc = self.cfg.train
-        frames = batch["frames"].to(self.device)
-        labels = batch["label"].to(self.device)
-        tasks = batch["task"]
-        task_flags = torch.tensor(
-            [0 if t == "deepfake" else 1 for t in tasks],
-            device=self.device
+    def _get_run_id(self, resume: bool, ckpt_root: str) -> str:
+        os.makedirs(ckpt_root, exist_ok=True)
+        run_dirs = sorted(
+            d for d in os.listdir(ckpt_root)
+            if d.startswith("run") and os.path.isdir(os.path.join(ckpt_root, d))
         )
 
-        with autocast(enabled=tc.use_amp and self.device.type == "cuda"):
-            outputs = self.model(frames)
-            loss_df, loss_sp, loss_temp = self._compute_task_losses(
-                outputs, labels, task_flags
-            )
-            losses = torch.stack([loss_df, loss_sp, loss_temp])
+        if resume and run_dirs:
+            # Find the most recent run that has last.pth
+            for run_id in reversed(run_dirs):
+                if os.path.exists(os.path.join(ckpt_root, run_id, "last.pth")):
+                    self.logger.info(f"Resuming run: {run_id}")
+                    return run_id
 
-            if tc.use_gradnorm:
-                weights = self.model.task_weights
-            else:
-                weights = torch.tensor(
-                    [tc.w_deepfake, tc.w_spoof, tc.w_temporal],
-                    device=self.device
-                )
-            total_loss = (weights * losses).sum() / tc.grad_accum_steps
-
-        self.scaler.scale(total_loss).backward()
-
-        return {
-            "loss_total": total_loss.item() * tc.grad_accum_steps,
-            "loss_df": loss_df.item(),
-            "loss_sp": loss_sp.item(),
-            "loss_temp": loss_temp.item(),
-            "w_df": weights[0].item(),
-            "w_sp": weights[1].item(),
-            "w_temp": weights[2].item(),
-        }
-
-    def _optimizer_step(self, losses_tensor: Optional[torch.Tensor] = None) -> None:
-        tc = self.cfg.train
-
-        # GradNorm update
-        if tc.use_gradnorm and self.gradnorm is not None and losses_tensor is not None:
-            shared_params = [
-                p for p in self.model.backbone.parameters() if p.requires_grad
-            ]
-            if shared_params:
-                self.gradnorm.update(losses_tensor, shared_params)
-
-        # Unscale once — required before both PCGrad and grad clipping
-        self.scaler.unscale_(self.optimizer)
-
-        # PCGrad (gradients are already unscaled at this point)
-        # Note: full PCGrad per-layer projection would go here if implemented
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), tc.max_grad_norm
-        )
-
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        self.optimizer.zero_grad()
-
-
-    def train_epoch(self, loader: DataLoader, epoch: int) -> dict:
-        """Run one training epoch with OOM handling."""
-        self.model.train()
-        tc = self.cfg.train
-        accum_losses = []
-        batch_metrics: Dict[str, List] = {
-            k: [] for k in ["loss_total", "loss_df", "loss_sp", "loss_temp",
-                             "w_df", "w_sp", "w_temp"]
-        }
-
-        self.optimizer.zero_grad()
-
-        for step, batch in enumerate(loader):
+        # New run
+        max_num = 0
+        for d in run_dirs:
             try:
-                step_out = self._train_step(batch, step % tc.grad_accum_steps)
-                for k, v in step_out.items():
-                    batch_metrics[k].append(v)
+                max_num = max(max_num, int(d.replace("run", "")))
+            except ValueError:
+                pass
+        new_id = f"run{max_num + 1:02d}"
+        self.logger.info(f"Starting new run: {new_id}")
+        return new_id
 
-                if (step + 1) % tc.grad_accum_steps == 0:
-                    self._optimizer_step()
-
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    self._handle_oom(e)
-                    continue
-                raise e
-
-        # Final step if leftover
-        if (step + 1) % tc.grad_accum_steps != 0:
-            self._optimizer_step()
-
-        return {k: float(np.mean(v)) for k, v in batch_metrics.items() if v}
-
-    def _handle_oom(self, error: Exception) -> None:
-        """Handle CUDA OOM by clearing cache or falling back to CPU."""
-        self.logger.warning(f"OOM: {error}")
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        if self.cfg.train.reduce_batch_on_oom:
-            new_bs = max(
-                self.cfg.train.min_batch_size,
-                self.current_batch_size // 2
-            )
-            if new_bs < self.current_batch_size:
-                self.logger.warning(
-                    f"Reducing batch size: {self.current_batch_size} -> {new_bs}"
-                )
-                self.current_batch_size = new_bs
-
-        if self.cfg.train.oom_fallback_cpu and self.device.type == "cuda":
-            self.logger.warning("Falling back to CPU for this step.")
-            self.model = self.model.cpu()
-            self.device = torch.device("cpu")
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def evaluate(
-        self,
-        ff_loader: DataLoader,
-        siw_loader: DataLoader,
-        epoch: int,
-    ) -> dict:
-        """Evaluate all three heads and return full metrics dict."""
+    def validate(self, loader) -> Dict:
+        """
+        Run full validation pass.
+        Returns a flat dict of all task metrics ready for logging.
+        """
         self.model.eval()
-        metrics = {}
+        base_model = self.model.module if self.use_multi_gpu else self.model
 
-        # ── Deepfake head (FF++) ──────────────────────────────────────────
-        df_labels, df_scores, df_videos, df_datasets = [], [], [], []
-        for batch in ff_loader:
-            frames = batch["frames"].to(self.device)
-            labels = batch["label"].numpy()
-            out = self.model(frames)
-            scores = torch.sigmoid(out["df_logit"]).cpu().numpy()
-            df_labels.append(labels)
-            df_scores.append(scores)
-            df_videos.extend(batch["video_path"])
-            df_datasets.extend(batch["dataset"])
+        # Accumulators
+        df_labels,  df_scores,  df_videos  = [], [], []
+        sp_labels,  sp_scores               = [], []
+        tmp_labels, tmp_scores              = [], []
+        ds_labels,  ds_datasets             = [], []   # for per-compression breakdown
+        running_loss = {"df": 0.0, "sp": 0.0, "temp": 0.0}
+        n_batches = 0
 
-        df_labels = np.concatenate(df_labels)
-        df_scores = np.concatenate(df_scores)
-        df_metrics = compute_deepfake_metrics(df_labels, df_scores, df_videos)
-        df_metrics.update(
-            compute_deepfake_metrics_by_compression(df_labels, df_scores, df_datasets)
-        )
-        metrics.update({f"df_{k}": v for k, v in df_metrics.items()})
+        for batch in tqdm(loader, desc="Validate", leave=False):
+            frames  = batch["frames"].to(self.device, non_blocking=True)
+            df_lbl  = batch["deepfake_label"].to(self.device).float()
+            sp_lbl  = batch["spoof_label"].to(self.device).float()
+            tmp_lbl = batch["temporal_label"].to(self.device).float()
+            videos  = batch.get("video_id", [""] * frames.size(0))
+            datasets= batch.get("dataset",  [""] * frames.size(0))
 
-        # ── Anti-spoof head (SiW-Mv2) ─────────────────────────────────────
-        sp_labels, sp_scores = [], []
-        for batch in siw_loader:
-            frames = batch["frames"].to(self.device)
-            labels = batch["label"].numpy()
-            out = self.model(frames)
-            scores = torch.sigmoid(out["sp_logit"]).cpu().numpy()
-            sp_labels.append(labels)
-            sp_scores.append(scores)
-
-        sp_labels = np.concatenate(sp_labels)
-        sp_scores = np.concatenate(sp_scores)
-        sp_metrics = compute_spoof_metrics(sp_labels, sp_scores)
-        metrics.update({f"sp_{k}": v for k, v in sp_metrics.items()})
-
-        # ── Temporal head (both datasets) ─────────────────────────────────
-        temp_labels, temp_scores = [], []
-        for loader in [ff_loader, siw_loader]:
-            for batch in loader:
-                frames = batch["frames"].to(self.device)
-                labels = batch["label"].numpy()
+            with self.autocast_ctx:
                 out = self.model(frames)
-                scores = torch.sigmoid(out["temp_logit"]).cpu().numpy()
-                temp_labels.append(labels)
-                temp_scores.append(scores)
 
-        temp_labels = np.concatenate(temp_labels)
-        temp_scores = np.concatenate(temp_scores)
-        temp_metrics = compute_temporal_metrics(temp_labels, temp_scores)
-        metrics.update({f"temp_{k}": v for k, v in temp_metrics.items()})
+                l_df   = self.criterion_df(out["deepfake_logit"].squeeze(1), df_lbl)
+                l_sp   = self.criterion_sp(out["spoof_logit"].squeeze(1),    sp_lbl)
+                l_temp = temporal_consistency_loss(out["temp_proj"], tmp_lbl)
 
+            running_loss["df"]   += l_df.item()
+            running_loss["sp"]   += l_sp.item()
+            running_loss["temp"] += l_temp.item()
+            n_batches += 1
+
+            # Collect predictions
+            df_scores.append(torch.sigmoid(out["deepfake_logit"].squeeze(1)).cpu().numpy())
+            df_labels.append(df_lbl.cpu().numpy())
+            df_videos.extend(videos)
+
+            sp_scores.append(torch.sigmoid(out["spoof_logit"].squeeze(1)).cpu().numpy())
+            sp_labels.append(sp_lbl.cpu().numpy())
+
+            tmp_scores.append(torch.sigmoid(out["temp_logit"].squeeze(1)).cpu().numpy())
+            tmp_labels.append(tmp_lbl.cpu().numpy())
+
+            ds_labels.extend(df_lbl.cpu().tolist())
+            ds_datasets.extend(datasets)
+
+        # Concatenate
+        df_scores  = np.concatenate(df_scores)
+        df_labels  = np.concatenate(df_labels)
+        sp_scores  = np.concatenate(sp_scores)
+        sp_labels  = np.concatenate(sp_labels)
+        tmp_scores = np.concatenate(tmp_scores)
+        tmp_labels = np.concatenate(tmp_labels)
+
+        # Compute metrics
+        df_metrics  = compute_deepfake_metrics(df_labels, df_scores, df_videos)
+        sp_metrics  = compute_spoof_metrics(sp_labels, sp_scores)
+        tmp_metrics = compute_temporal_metrics(tmp_labels, tmp_scores)
+        comp_metrics= compute_deepfake_metrics_by_compression(
+            np.array(ds_labels), df_scores, ds_datasets
+        )
+
+        val_losses = {k: v / max(n_batches, 1) for k, v in running_loss.items()}
+
+        metrics = {
+            "val_loss_df":   val_losses["df"],
+            "val_loss_sp":   val_losses["sp"],
+            "val_loss_temp": val_losses["temp"],
+            **{f"df_{k}":  v for k, v in df_metrics.items()},
+            **{f"sp_{k}":  v for k, v in sp_metrics.items()},
+            **{f"tmp_{k}": v for k, v in tmp_metrics.items()},
+            **{f"comp_{k}":v for k, v in comp_metrics.items()},
+        }
         return metrics
 
-    def _log_epoch(self, epoch: int, train_m: dict, val_m: dict, lr: float,
-                   elapsed: float, power_w: float) -> None:
-        """Print a clean per-epoch summary to logger."""
-        log_banner(self.logger, f"Epoch {epoch:03d} Summary")
+    # ------------------------------------------------------------------
+    # Epoch logging
+    # ------------------------------------------------------------------
 
-        self.logger.info(
-            f"  LR: {lr:.2e} | Time: {elapsed:.1f}s | Avg Power: {power_w:.1f}W"
-        )
-        self.logger.info(
-            f"  Train | total={train_m['loss_total']:.4f} "
-            f"df={train_m['loss_df']:.4f} "
-            f"sp={train_m['loss_sp']:.4f} "
-            f"temp={train_m['loss_temp']:.4f}"
-        )
-        self.logger.info(
-            f"  Weights | df={train_m['w_df']:.3f} "
-            f"sp={train_m['w_sp']:.3f} "
-            f"temp={train_m['w_temp']:.3f}"
-        )
-        # Deepfake metrics
-        self.logger.info(
-            f"  Deepfake | AUC={val_m.get('df_auc_roc', 0):.4f} "
-            f"EER={val_m.get('df_eer', 0):.4f} "
-            f"AP={val_m.get('df_ap', 0):.4f} "
-            f"Acc@T={val_m.get('df_acc_best_thresh', 0):.4f} "
-            f"VideoAUC={val_m.get('df_video_auc', 0):.4f} "
-            f"C23={val_m.get('df_auc_c23', 0):.4f} "
-            f"C40={val_m.get('df_auc_c40', 0):.4f}"
-        )
-        # Anti-spoof metrics
-        self.logger.info(
-            f"  AntiSpoof | HTER={val_m.get('sp_hter', 0):.4f} "
-            f"ACER={val_m.get('sp_acer', 0):.4f} "
-            f"APCER={val_m.get('sp_apcer', 0):.4f} "
-            f"BPCER={val_m.get('sp_bpcer', 0):.4f} "
-            f"TPR@FPR1%={val_m.get('sp_tpr_at_fpr1', 0):.4f} "
-            f"AUC={val_m.get('sp_auc', 0):.4f}"
-        )
-        # Temporal metrics
-        self.logger.info(
-            f"  Temporal | BinAcc={val_m.get('temp_bin_acc', 0):.4f} "
-            f"AUC={val_m.get('temp_auc', 0):.4f} "
-            f"DF-AUC={val_m.get('temp_df_auc', 0):.4f}"
-        )
-
-    def fit(
+    def _log_epoch(
         self,
-        train_loader: DataLoader,
-        val_ff_loader: DataLoader,
-        val_siw_loader: DataLoader,
+        epoch: int,
+        train_metrics: Dict,
+        val_metrics: Dict,
+        elapsed: float,
+        power_w: float,
+        lr: float,
     ) -> None:
-        """Main training loop."""
-        cfg = self.cfg
-        tc = cfg.train
-        log_banner(self.logger, f"Training: {self.run_id} | Device: {self.device}")
+        """
+        1. Append to in-memory history.
+        2. Persist history.json.
+        3. Write one row to result CSV via ResultLogger.
+        4. Print a concise summary to the logger.
+        """
+        tc = self.cfg.train
 
-        power_monitor = None
-        if cfg.power.enable:
-            power_monitor = PowerMonitor(cfg)
-            power_monitor.start()
+        # Assemble row
+        base_model = self.model.module if self.use_multi_gpu else self.model
+        w = base_model.task_weights.detach().cpu().tolist() if hasattr(base_model, "task_weights") else [
+            tc.w_deepfake, tc.w_spoof, tc.w_temporal
+        ]
+
+        row = {
+            "epoch":      epoch,
+            "run_id":     self.run_id,
+            "lr":         round(lr, 8),
+            "elapsed_s":  round(elapsed, 1),
+            "power_w":    round(power_w, 2),
+            # Train losses
+            "loss_total": round(train_metrics.get("loss_total", 0.0), 5),
+            "loss_df":    round(train_metrics.get("loss_df",    0.0), 5),
+            "loss_sp":    round(train_metrics.get("loss_sp",    0.0), 5),
+            "loss_temp":  round(train_metrics.get("loss_temp",  0.0), 5),
+            # Task weights
+            "w_df":  round(w[0], 4),
+            "w_sp":  round(w[1], 4),
+            "w_temp":round(w[2], 4),
+            **val_metrics,
+        }
+
+        self.history.append(row)
+        self._save_history()
+        self.result_logger.log(row)
+
+        # ── Console summary ───────────────────────────────────────────
+        df_auc  = val_metrics.get("df_auc",  float("nan"))
+        sp_acer = val_metrics.get("sp_acer", float("nan"))
+        tmp_acc = val_metrics.get("tmp_acc", float("nan"))
+
+        self.logger.info(
+            f"[{epoch:03d}/{tc.num_epochs}]  "
+            f"loss={row['loss_total']:.4f}  "
+            f"df_auc={df_auc:.4f}  "
+            f"sp_acer={sp_acer:.4f}  "
+            f"tmp_acc={tmp_acc:.4f}  "
+            f"lr={lr:.2e}  "
+            f"t={elapsed:.0f}s  "
+            f"P={power_w:.1f}W"
+        )
+
+    # ------------------------------------------------------------------
+    # Main training loop
+    # ------------------------------------------------------------------
+
+    def fit(self, train_loader, val_ff_loader, val_siw_loader) -> None:
+        tc = self.cfg.train
+        log_banner(self.logger, f"Training  run={self.run_id}")
+
+        self.power_monitor.start()
 
         for epoch in range(self.start_epoch, tc.num_epochs):
-            self.logger.info(f"Runing Epoch {epoch + 1}")
             t0 = time.time()
 
-            # Phase 1: freeze backbone
-            if epoch < cfg.model.freeze_backbone_epochs:
-                self._freeze_backbone(True)
-            elif epoch == cfg.model.freeze_backbone_epochs:
-                self._freeze_backbone(False)
+            # ── Train one epoch ───────────────────────────────────────
+            train_metrics = self._train_epoch(epoch, train_loader)
 
-            # Training
-            train_metrics = self.train_epoch(train_loader, epoch)
+            # ── Validate (FF++ → deepfake metrics, SiW → spoof metrics) ──
+            ff_metrics  = self.validate(val_ff_loader)
+            siw_metrics = self.validate(val_siw_loader)
 
-            # Evaluation
-            val_metrics = {}
-            if (epoch + 1) % cfg.eval.eval_every == 0:
-                val_metrics = self.evaluate(val_ff_loader, val_siw_loader, epoch)
+            # prefix keys to avoid collision, then merge
+            val_metrics = (
+                {f"ff_{k}":  v for k, v in ff_metrics.items()}  |
+                {f"siw_{k}": v for k, v in siw_metrics.items()}
+            )
 
-            # LR step
-            if tc.scheduler == "plateau":
-                self.scheduler.step(val_metrics.get("df_auc_roc", 0))
+            # ── Scheduler step ────────────────────────────────────────
+            if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                self.scheduler.step(ff_metrics.get("df_auc", 0.0))
             else:
                 self.scheduler.step()
 
             current_lr = self.optimizer.param_groups[0]["lr"]
-            elapsed = time.time() - t0
+            elapsed    = time.time() - t0
+            power_w    = float(np.mean(self.power_monitor.readings)) if self.power_monitor.readings else 0.0
 
-            # Power reading
-            power_w = 0.0
-            if power_monitor and power_monitor.readings:
-                power_w = float(np.mean(power_monitor.readings[-5:]))
-
-            # Log
-            self._log_epoch(epoch + 1, train_metrics, val_metrics,
-                            current_lr, elapsed, power_w)
-
-            # Best model tracking (primary: deepfake AUC + spoof AUC avg)
-            primary = (
-                val_metrics.get("df_auc_roc", 0) +
-                val_metrics.get("sp_auc", 0)
-            ) / 2
-            is_best = primary > self.best_metric
+            # ── Best-model tracking ───────────────────────────────────
+            composite = (
+                ff_metrics.get("df_auc",  0.0) * 0.5 +
+                (1.0 - siw_metrics.get("sp_acer", 1.0)) * 0.5
+            )
+            is_best = composite > self.best_metric
             if is_best:
-                self.best_metric = primary
-                self.best_epoch = epoch + 1
+                self.best_metric = composite
+                self.best_epoch  = epoch
 
-            # Save checkpoint
-            combined_metrics = {**train_metrics, **val_metrics,
-                                 "epoch": epoch + 1, "lr": current_lr,
-                                 "power_w": power_w, "elapsed_s": elapsed}
-            self._save_checkpoint(epoch + 1, combined_metrics, is_best)
+            # ── Checkpoint ────────────────────────────────────────────
+            self._save_checkpoint(epoch, {**train_metrics, **val_metrics}, is_best=is_best)
 
-            # CSV log
-            self.result_logger.log({
-                "epoch": epoch + 1,
-                "run_id": self.run_id,
-                "lr": current_lr,
-                "elapsed_s": round(elapsed, 2),
-                "power_w": round(power_w, 2),
-                **{k: round(v, 6) if isinstance(v, float) else v
-                   for k, v in combined_metrics.items()},
-            })
+            # ── Logging ───────────────────────────────────────────────
+            self._log_epoch(epoch, train_metrics, val_metrics, elapsed, power_w, current_lr)
 
-        # Final power average
-        total_power = 0.0
-        if power_monitor:
-            total_power = power_monitor.stop()
-            self.logger.info(f"Average power consumption: {total_power:.1f} W")
+            # ── Early stopping ────────────────────────────────────────
+            if self.early_stopping and self.early_stopping.step(composite):
+                self.logger.info(
+                    f"Early stopping triggered at epoch {epoch}  "
+                    f"(best epoch: {self.best_epoch})"
+                )
+                break
 
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        # ── End of training ───────────────────────────────────────────
+        avg_power = self.power_monitor.stop()
+        self.power_monitor.log_summary(self.logger)
         log_banner(
             self.logger,
-            f"Training done | Best epoch: {self.best_epoch} | "
-            f"Best metric: {self.best_metric:.4f}"
+            f"Done  best={self.best_metric:.4f} @ epoch {self.best_epoch}  "
+            f"avg_power={avg_power:.1f}W"
         )
+
+
+    # ------------------------------------------------------------------
+    # Single train epoch
+    # ------------------------------------------------------------------
+
+    def _train_epoch(self, epoch: int, loader) -> Dict:
+        """Run one full training epoch, return averaged loss dict."""
+        self.model.train()
+        tc         = self.cfg.train
+        base_model = self.model.module if self.use_multi_gpu else self.model
+
+        accum = {"total": 0.0, "df": 0.0, "sp": 0.0, "temp": 0.0}
+        n     = 0
+
+        pbar = tqdm(loader, desc=f"Train {epoch:03d}", leave=False)
+        for step, batch in enumerate(pbar):
+            frames  = batch["frames"].to(self.device, non_blocking=True)
+            df_lbl  = batch["deepfake_label"].to(self.device).float()
+            sp_lbl  = batch["spoof_label"].to(self.device).float()
+            tmp_lbl = batch["temporal_label"].to(self.device).float()
+
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with self.autocast_ctx:
+                out    = self.model(frames)
+                l_df   = self.criterion_df(out["deepfake_logit"].squeeze(1), df_lbl)
+                l_sp   = self.criterion_sp(out["spoof_logit"].squeeze(1),    sp_lbl)
+                l_temp = temporal_consistency_loss(out["temp_proj"], tmp_lbl)
+
+                # Task weights (GradNorm or fixed)
+                w = base_model.task_weights
+                loss = w[0] * l_df + w[1] * l_sp + w[2] * l_temp
+
+            # ── Backward ──────────────────────────────────────────────
+            if self.use_pcgrad:
+                pcgrad_step(
+                    [w[0] * l_df, w[1] * l_sp, w[2] * l_temp],
+                    self.optimizer,
+                    retain_graph=self.use_gradnorm,
+                )
+            else:
+                self.scaler.scale(loss).backward(
+                    retain_graph=self.use_gradnorm
+                )
+
+            # ── GradNorm update ───────────────────────────────────────
+            if self.use_gradnorm:
+                new_w = self.gradnorm_manager.update(
+                    [l_df, l_sp, l_temp],
+                    list(base_model.backbone.parameters()),
+                )
+                base_model.task_weights = new_w
+
+            # ── Gradient clipping & optimizer step ────────────────────
+            if not self.use_pcgrad:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), tc.grad_clip
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+
+            # ── Accumulate ────────────────────────────────────────────
+            accum["total"] += loss.item()
+            accum["df"]    += l_df.item()
+            accum["sp"]    += l_sp.item()
+            accum["temp"]  += l_temp.item()
+            n += 1
+
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        denom = max(n, 1)
+        return {
+            "loss_total": accum["total"] / denom,
+            "loss_df":    accum["df"]    / denom,
+            "loss_sp":    accum["sp"]    / denom,
+            "loss_temp":  accum["temp"]  / denom,
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────────────

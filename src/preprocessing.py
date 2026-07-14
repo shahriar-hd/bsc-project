@@ -55,17 +55,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# =========================================================================== #
-# Constants
-# =========================================================================== #
-FRAMES_PER_CLIP: int = 64
-MAX_CLIPS_FF: int = 3
-MAX_CLIPS_SIW: int = 1
-MIN_FACE_SCORE: float = 0.65
-MIN_VALID_FRAMES: int = 48           # 75 % of FRAMES_PER_CLIP
-MARGIN: int = 25                     # frames to skip at start/end of video
-DISP_RATIO: float = 0.30             # kept for log message only
-
 
 # =========================================================================== #
 # InsightFace — lightweight detector (buffalo_sc)
@@ -81,9 +70,8 @@ class FaceDetector:
     def __init__(
         self,
         config: PreprocessConfig,
-        min_face_score: float = MIN_FACE_SCORE,
     ) -> None:
-        self.min_face_score = min_face_score
+        self.min_face_score = config.min_face_score
         self.output_size: int = config.output_face_size
         self.crop_scale: float = config.crop_scale
 
@@ -164,56 +152,54 @@ def _displacement(a, b) -> float:
 # =========================================================================== #
 # Clip start-frame calculator
 # =========================================================================== #
-def compute_clip_starts_ff(total_frames: int) -> List[int]:
-    """
-    Compute three clip start indices for a FF++ video.
-
-    Layout (all clips are FRAMES_PER_CLIP consecutive frames):
-      clip-0 (early)  : starts at MARGIN
-      clip-1 (middle) : centred on midpoint
-      clip-2 (late)   : ends at (total_frames - MARGIN)
-
-    Args:
-        total_frames: Total source frames in the video.
-    Returns:
-        List of start indices; may have fewer than 3 entries if video is short.
-    """
-    if total_frames < FRAMES_PER_CLIP + 2 * MARGIN:
+def compute_clip_starts_ff(
+    total_frames: int,
+    stride: int,
+    config: PreprocessConfig,
+) -> List[int]:
+    """Dense clip sampling with variable stride based on label."""
+    min_frames = config.frames_per_clip + 2 * config.margin
+    if total_frames < min_frames:
         return []
 
-    usable_end = total_frames - MARGIN
+    usable_start = config.margin
+    usable_end   = total_frames - config.margin
 
-    # clip-0: early
-    s0 = MARGIN
+    starts: List[int] = []
+    s = usable_start
+    while s + config.frames_per_clip <= usable_end:
+        starts.append(s)
+        s += stride
 
-    # clip-1: middle (centred)
-    mid = total_frames // 2
-    s1 = max(s0, mid - FRAMES_PER_CLIP // 2)
-    s1 = min(s1, usable_end - FRAMES_PER_CLIP)
-
-    # clip-2: late
-    s2 = usable_end - FRAMES_PER_CLIP
-    s2 = max(s1 + FRAMES_PER_CLIP, s2)
-
-    starts = [s0]
-    if s1 > s0:
-        starts.append(s1)
-    if s2 > (starts[-1] + FRAMES_PER_CLIP - 1) and s2 != s0:
-        starts.append(s2)
-
-    return [s for s in starts[:3] if s + FRAMES_PER_CLIP <= total_frames]
+    return starts
 
 
-def compute_clip_start_siw(total_frames: int) -> Optional[int]:
+def compute_clip_starts_siw(
+    total_frames: int,stride: int,
+    config: PreprocessConfig,
+) -> List[int]:
     """
-    Compute a single centred clip start for SiW-Mv2.
+    Dense clip sampling for SiW-Mv2 with variable stride.
 
-    Returns:
-        Start index or None if video is too short.
+    - real (live): large stride → fewer clips
+    - spoof: small stride → more clips
     """
-    if total_frames < FRAMES_PER_CLIP:
-        return None
-    return max(0, total_frames // 2 - FRAMES_PER_CLIP // 2)
+    min_frames = config.frames_per_clip + 2 * config.margin
+    if total_frames < min_frames:
+        return []
+
+    usable_start = config.margin
+    usable_end   = total_frames - config.margin
+
+    starts: List[int] = []
+    s = usable_start
+    while s + config.frames_per_clip <= usable_end:
+        starts.append(s)
+        s += stride
+
+    return starts
+
+
 
 
 # =========================================================================== #
@@ -269,56 +255,26 @@ def extract_clip(
     clip_idx: int,
     config: PreprocessConfig,
 ) -> List[Dict]:
-    """
-    Extract one temporally-stable clip in two passes.
-
-    Pass 1 — Anchor pass (all FRAMES_PER_CLIP frames):
-        Run buffalo_sc on every frame.
-        Collect bboxes that pass det_score threshold.
-        Compute the MEAN bbox → one fixed crop window for the whole clip.
-        Reject the clip early if too few detections exist.
-
-    Pass 2 — Save pass (all FRAMES_PER_CLIP frames):
-        For each frame, verify the detected face overlaps the fixed window.
-        Frames where the face is absent OR has jumped outside the window
-        are skipped (subject-level jitter, e.g. scene cut).
-        Apply the fixed window crop and save as JPEG.
-
-    Args:
-        video_path:  Source video file.
-        start_frame: Index of the first frame of this clip in the video.
-        detector:    Initialised FaceDetector.
-        out_dir:     Subject-level output directory.
-        clip_idx:    Clip index within this video (0-based).
-        config:      PreprocessConfig instance (for jpeg_quality etc.).
-
-    Returns:
-        List of frame-level record dicts; empty list if clip is rejected.
-    """
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, config.jpeg_quality]
 
-    # ── Pass 1: read all frames, detect faces, collect bboxes ────────────── #
     raw_frames: List[Tuple[int, np.ndarray]] = []
     per_frame_bbox: List[Optional[np.ndarray]] = []
 
-    for src_idx, bgr in read_consecutive_frames(video_path, start_frame, FRAMES_PER_CLIP):
+    for src_idx, bgr in read_consecutive_frames(
+        video_path, start_frame, config.frames_per_clip
+    ):
         raw_frames.append((src_idx, bgr))
         face = detector.detect_best(bgr)
         per_frame_bbox.append(face.bbox if face is not None else None)
 
-    if len(raw_frames) < MIN_VALID_FRAMES:
-        logger.debug("Clip %d: video too short (%d frames)", clip_idx, len(raw_frames))
+    if len(raw_frames) < config.min_valid_frames:
         return []
 
     valid_bboxes = [b for b in per_frame_bbox if b is not None]
-    if len(valid_bboxes) < MIN_VALID_FRAMES:
-        logger.debug(
-            "Clip %d: only %d/%d frames had a detectable face",
-            clip_idx, len(valid_bboxes), len(raw_frames),
-        )
+
+    if len(valid_bboxes) < config.min_valid_frames:
         return []
 
-    # ── Compute one stable window from the mean of all valid bboxes ──────── #
     H, W = raw_frames[0][1].shape[:2]
     crop_coords = _compute_average_crop_coords(
         valid_bboxes,
@@ -326,32 +282,37 @@ def extract_clip(
         crop_scale=detector.crop_scale,
         output_size=detector.output_size,
     )
+
     if crop_coords is None:
         return []
 
-    # ── Pass 2: validate each frame against the fixed window, then save ───── #
     out_dir.mkdir(parents=True, exist_ok=True)
     records: List[Dict] = []
     saved_idx: int = 0
 
     for (src_idx, bgr), bbox in zip(raw_frames, per_frame_bbox):
         if bbox is None:
-            logger.debug("Clip %d frame %d: no detection → skip", clip_idx, src_idx)
             continue
 
-        if not _face_inside_window(bbox, crop_coords):
-            logger.debug("Clip %d frame %d: face outside window → skip", clip_idx, src_idx)
+        if not _face_inside_window(
+            bbox,
+            crop_coords,
+            iou_threshold=config.disp_ratio,
+        ):
             continue
 
-        ix1, iy1, ix2, iy2 = crop_coords
-        region = bgr[iy1:iy2, ix1:ix2]
+        x1, y1, x2, y2 = crop_coords
+        crop = bgr[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+
         crop = cv2.resize(
-            region,
+            crop,
             (detector.output_size, detector.output_size),
             interpolation=cv2.INTER_LINEAR,
         )
 
-        filename  = f"c{clip_idx}_f{saved_idx:03d}.jpg"
+        filename = f"c{clip_idx}_f{saved_idx:03d}.jpg"
         save_path = out_dir / filename
         cv2.imwrite(str(save_path), crop, encode_params)
 
@@ -364,8 +325,7 @@ def extract_clip(
         })
         saved_idx += 1
 
-    # ── Final length check ────────────────────────────────────────────────── #
-    if len(records) < MIN_VALID_FRAMES:
+    if len(records) < config.min_valid_frames:
         logger.debug(
             "Clip %d: only %d valid frames after window filtering → reject",
             clip_idx, len(records),
@@ -551,12 +511,6 @@ def process_video(
     detector: FaceDetector,
     config: PreprocessConfig,
 ) -> List[Dict]:
-    """
-    Extract all clips for one video and save frames under a subject subfolder.
-
-    Output path:
-        processed/<dataset>/<label>/sub_<000000>/c<i>_f<nnn>.jpg
-    """
     video_path = Path(str(meta["video_path"]))
     dataset    = str(meta["dataset"])
     label      = str(meta["label"])
@@ -567,12 +521,19 @@ def process_video(
         logger.warning("Cannot read: %s", video_path)
         return []
 
+    if label == "real":
+        stride = config.clip_stride_real
+    elif label == "fake":
+        stride = config.clip_stride_fake
+    else:  # "spoof"
+        stride = config.clip_stride_spoof
+
     is_ff = (dataset == config.ff_dataset_name)
+
     if is_ff:
-        clip_starts = compute_clip_starts_ff(total_frames)
+        clip_starts = compute_clip_starts_ff(total_frames, stride, config)
     else:
-        s = compute_clip_start_siw(total_frames)
-        clip_starts = [s] if s is not None else []
+        clip_starts = compute_clip_starts_siw(total_frames, stride, config)
 
     if not clip_starts:
         logger.warning("Too short (%d frames): %s", total_frames, video_path)
@@ -583,7 +544,6 @@ def process_video(
     )
 
     all_records: List[Dict] = []
-
     for clip_idx, start in enumerate(clip_starts):
         clip_records = extract_clip(
             video_path=video_path,
@@ -591,15 +551,8 @@ def process_video(
             detector=detector,
             out_dir=subject_out_dir,
             clip_idx=clip_idx,
-            config=config,                    # ← passed explicitly
+            config=config,
         )
-
-        if not clip_records:
-            logger.debug(
-                "Clip %d rejected: %s (start=%d)", clip_idx, video_path.name, start
-            )
-            continue
-
         for rec in clip_records:
             rec.update({
                 "video_path":  str(meta["video_path"]),
@@ -612,8 +565,7 @@ def process_video(
                 "split":       str(meta["split"]),
                 "video_index": video_index,
             })
-
-        all_records.extend(clip_records)
+            all_records.append(rec)
 
     return all_records
 
@@ -688,12 +640,12 @@ def log_summary(all_records: List[Dict]) -> None:
 def run_pipeline(config: PreprocessConfig) -> None:
     logger.info("=== Preprocessing pipeline started ===")
     logger.info(
-        "Clip settings: %d frames/clip | FF++: %d clips | SiW: %d clip",
-        FRAMES_PER_CLIP, MAX_CLIPS_FF, MAX_CLIPS_SIW,
+        "Clip settings: %d frames/clip | FF++: %d stride | SiW: %d stride | Real (all datasets): %d stride",
+        config.frames_per_clip, config.clip_stride_fake, config.clip_stride_spoof, config.clip_stride_real,
     )
     logger.info(
         "Quality gate: score>=%.2f | displacement_ratio<=%.2f | min_valid=%d",
-        MIN_FACE_SCORE, DISP_RATIO, MIN_VALID_FRAMES,
+        config.min_face_score, config.disp_ratio, config.min_valid_frames,
     )
 
     records: List[VideoMeta] = []
@@ -707,7 +659,7 @@ def run_pipeline(config: PreprocessConfig) -> None:
     logger.info("Total videos: %d", len(records))
     records = split_by_subject(records, config)
 
-    detector = FaceDetector(config, min_face_score=MIN_FACE_SCORE)
+    detector = FaceDetector(config)
 
     all_frame_records: List[Dict] = []
     skipped = 0
