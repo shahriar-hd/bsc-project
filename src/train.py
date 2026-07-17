@@ -502,7 +502,7 @@ class MTLDataset(Dataset):
         # ── Task-specific labels ──────────────────────────────────
         task = clip["task"]
         binary_label = clip["label"]  # 0=real/live, 1=fake/spoof
-        
+
         if task == "deepfake":
             deepfake_label = binary_label
             spoof_label = 0  # placeholder
@@ -803,7 +803,7 @@ class MTLModel(nn.Module):
     def task_weights(self, weights: torch.Tensor) -> None:
         """Set log_weights from desired positive task weights."""
         with torch.no_grad():
-            self.log_weights.copy_(torch.log(weights / weights.mean()))
+            self.log_weights.copy_(torch.log(weights / weights.mean() + 1e-8))
 
 
     def forward(
@@ -823,15 +823,20 @@ class MTLModel(nn.Module):
 
         df_logit = self.deepfake_head(frame_feat)
         sp_logit = self.spoof_head(frame_feat)
-        temp_proj, temp_logit = self.temporal_head(feats)
+        temp_out   = self.temporal_head(feats)
+        temp_proj  = temp_out["temp_proj"]
+        temp_logit = temp_out["temp_logit"]
 
         return {
-            "df_logit": df_logit,
-            "sp_logit": sp_logit,
-            "temp_logit": temp_logit,
-            "temp_proj": temp_proj,    # (B, T, H) for temporal loss
-            "feats": feats,
-        }
+   		 "deepfake_logit":         df_logit,
+   		 "spoof_logit":         sp_logit,
+  		  "temp_logit":       temp_logit,
+    		"temp_proj":        temp_proj,
+    		"pseudo_label":     temp_out.get("pseudo_label"),
+   		 "flow_consistency": temp_out.get("flow_consistency"),
+    		"feats":            feats,
+		}
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1192,7 +1197,7 @@ class GradNormManager:
         if init_weights is None:
             init_weights = [1.0] * num_tasks
         log_init = [float(np.log(max(w, 1e-6))) for w in init_weights]
-        
+
         self.log_weights = nn.Parameter(
             torch.tensor(log_init, dtype=torch.float32, device=device),
             requires_grad=True,
@@ -1260,7 +1265,7 @@ class GradNormManager:
             else:
                 task_norm = torch.tensor(0.0, device=self.device)
             norms.append(task_norm)
-        
+
         norms = torch.stack(norms)  # (num_tasks,)
 
         # 5. Compute loss ratios: L_i(t) / L_i(0)
@@ -1323,14 +1328,14 @@ def pcgrad_step(
         retain_graph: whether to keep computation graph after backward
     """
     num_tasks = len(losses)
-    
+
     # 1. Collect parameters from optimizer
     params = []
     for group in optimizer.param_groups:
         for p in group["params"]:
             if p.requires_grad:
                 params.append(p)
-    
+
     if not params:
         return
 
@@ -1339,7 +1344,7 @@ def pcgrad_step(
     for i, loss in enumerate(losses):
         optimizer.zero_grad()
         loss.backward(retain_graph=True)
-        
+
         # Flatten gradients into a single vector
         grad_vec = []
         for p in params:
@@ -1965,9 +1970,11 @@ class Trainer:
         self.model.train()
         tc         = self.cfg.train
         base_model = self.model.module if self.use_multi_gpu else self.model
-
+    
         accum = {"total": 0.0, "df": 0.0, "sp": 0.0, "temp": 0.0}
         n     = 0
+    
+        self.optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(loader, desc=f"Train {epoch:03d}", leave=False)
         for step, batch in enumerate(pbar):
@@ -1975,23 +1982,24 @@ class Trainer:
             df_lbl  = batch["deepfake_label"].to(self.device).float()
             sp_lbl  = batch["spoof_label"].to(self.device).float()
             tmp_lbl = batch["temporal_label"].to(self.device).float()
-
-            self.optimizer.zero_grad(set_to_none=True)
-
+    
             with self.autocast_ctx:
                 out    = self.model(frames)
-                l_df   = self.criterion_df(out["deepfake_logit"].squeeze(1), df_lbl)
-                l_sp   = self.criterion_sp(out["spoof_logit"].squeeze(1),    sp_lbl)
+    
+                l_df   = self.criterion_df(out["deepfake_logit"], df_lbl)
+                l_sp   = self.criterion_sp(out["spoof_logit"],   sp_lbl)
                 l_temp = temporal_consistency_loss(out["temp_proj"], tmp_lbl)
-
-                # Task weights (GradNorm or fixed)
-                w = base_model.task_weights
-                loss = w[0] * l_df + w[1] * l_sp + w[2] * l_temp
-
-            # ── Backward ──────────────────────────────────────────────
+    
+                # Task weights
+                w    = base_model.task_weights                # (3,) normalized
+                loss = (w[0] * l_df + w[1] * l_sp + w[2] * l_temp) / tc.grad_accum_steps
+    
+            # ── Backward ──────────────────────────────
             if self.use_pcgrad:
                 pcgrad_step(
-                    [w[0] * l_df, w[1] * l_sp, w[2] * l_temp],
+                    [w[0] * l_df / tc.grad_accum_steps,
+                     w[1] * l_sp / tc.grad_accum_steps,
+                     w[2] * l_temp / tc.grad_accum_steps],
                     self.optimizer,
                     retain_graph=self.use_gradnorm,
                 )
@@ -1999,33 +2007,42 @@ class Trainer:
                 self.scaler.scale(loss).backward(
                     retain_graph=self.use_gradnorm
                 )
-
-            # ── GradNorm update ───────────────────────────────────────
+    
             if self.use_gradnorm:
+                losses_tensor = torch.stack([l_df, l_sp, l_temp])  # fix: list→Tensor
                 new_w = self.gradnorm_manager.update(
-                    [l_df, l_sp, l_temp],
+                    losses_tensor,
                     list(base_model.backbone.parameters()),
                 )
-                base_model.task_weights = new_w
 
-            # ── Gradient clipping & optimizer step ────────────────────
-            if not self.use_pcgrad:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), tc.grad_clip
-                )
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                with torch.no_grad():
+                    base_model.log_weights.copy_(
+                        torch.log(new_w.clamp(min=1e-8))
+                    )
 
-            # ── Accumulate ────────────────────────────────────────────
-            accum["total"] += loss.item()
+            is_accum_step = (step + 1) % tc.grad_accum_steps == 0
+            is_last_step  = (step + 1) == len(loader)
+    
+            if is_accum_step or is_last_step:
+                if not self.use_pcgrad:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), tc.max_grad_norm  # fix: grad_clip→max_grad_norm
+                    )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+
+                self.optimizer.zero_grad(set_to_none=True)
+    
+            # ── Accumulate metrics ────────────────────────────────
+            accum["total"] += loss.item() * tc.grad_accum_steps   # مقدار واقعی loss
             accum["df"]    += l_df.item()
             accum["sp"]    += l_sp.item()
             accum["temp"]  += l_temp.item()
             n += 1
-
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
-
+    
+            pbar.set_postfix(loss=f"{loss.item() * tc.grad_accum_steps:.4f}")
+    
         denom = max(n, 1)
         return {
             "loss_total": accum["total"] / denom,
@@ -2033,8 +2050,7 @@ class Trainer:
             "loss_sp":    accum["sp"]    / denom,
             "loss_temp":  accum["temp"]  / denom,
         }
-
-
+    
 # ──────────────────────────────────────────────────────────────────────────────
 # Data Loading Helpers
 # ──────────────────────────────────────────────────────────────────────────────

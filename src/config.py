@@ -195,11 +195,12 @@ class ModelConfig:
 class TrainConfig:
     seed: int = 42
     num_epochs: int = 25
-    batch_size: int = 16                       # per GPU TODO: change batch size
+    batch_size: int = 16                     # per GPU TODO: change batch size
     num_workers: int = 4
     pin_memory: bool = True
     grad_accum_steps: int = 2                  # effective batch = batch_size * accum
-    resume: bool = False                        # TODO: True 
+    gradnorm_interval = 10
+    resume: bool = True                        # TODO: True 
 
     # Temporal sampling
     num_frames: int = 16                       # T frames per clip
@@ -249,11 +250,11 @@ class TrainConfig:
 
     # ── Device & precision ──────────────────────────────────────────────────
     device: str = "cuda"               # "cuda", "cpu", or "cuda:0,1,..."
-    amp_dtype: str = "float16"         # "float16" | "bfloat16" | "float32" (float32 = AMP disabled)
+    amp_dtype: str = "bfloat16"         # "float16" | "bfloat16" | "float32" (float32 = AMP disabled)
     fallback_to_cpu: bool = True       # if CUDA unavailable, fall back to CPU silently
     # TODO:
     # ── Multi-GPU ────────────────────────────────────────────────────────────
-    use_ddp: bool = False              # DistributedDataParallel (multi-node)
+    use_ddp: bool = True               # DistributedDataParallel (multi-node)
     use_data_parallel: bool = True     # DataParallel (single-node multi-GPU, simpler)
     gpu_ids: list = field(default_factory=lambda: [])  # e.g. [0,1]; empty = all visible
 
