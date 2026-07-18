@@ -1770,9 +1770,13 @@ class Trainer:
             with self.autocast_ctx:
                 out = self.model(frames)
 
-                l_df   = self.criterion_df(out["deepfake_logit"].squeeze(1), df_lbl)
-                l_sp   = self.criterion_sp(out["spoof_logit"].squeeze(1),    sp_lbl)
-                l_temp = temporal_consistency_loss(out["temp_proj"], tmp_lbl)
+                df_logit  = out["deepfake_logit"].flatten()
+                sp_logit  = out["spoof_logit"].flatten()
+                tmp_logit = out["temp_logit"].flatten()
+
+                l_df   = self.criterion_df(df_logit, df_lbl)
+                l_sp   = self.criterion_sp(sp_logit, sp_lbl)
+                l_temp = temporal_consistency_loss(out["temp_proj"], tmp_logit)
 
             running_loss["df"]   += l_df.item()
             running_loss["sp"]   += l_sp.item()
@@ -1780,18 +1784,19 @@ class Trainer:
             n_batches += 1
 
             # Collect predictions
-            df_scores.append(torch.sigmoid(out["deepfake_logit"].squeeze(1)).cpu().numpy())
+            df_scores.append(torch.sigmoid(df_logit).cpu().numpy())
             df_labels.append(df_lbl.cpu().numpy())
             df_videos.extend(videos)
 
-            sp_scores.append(torch.sigmoid(out["spoof_logit"].squeeze(1)).cpu().numpy())
+            sp_scores.append(torch.sigmoid(sp_logit).cpu().numpy())
             sp_labels.append(sp_lbl.cpu().numpy())
 
-            tmp_scores.append(torch.sigmoid(out["temp_logit"].squeeze(1)).cpu().numpy())
+            tmp_scores.append(torch.sigmoid(tmp_logit).cpu().numpy())
             tmp_labels.append(tmp_lbl.cpu().numpy())
 
             ds_labels.extend(df_lbl.cpu().tolist())
             ds_datasets.extend(datasets)
+
 
         # Concatenate
         df_scores  = np.concatenate(df_scores)
