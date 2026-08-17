@@ -94,6 +94,7 @@ def compute_clip_starts(
     total_frames: int,
     stride: int,
     config: PreprocessConfig,
+    max_clips: int = 0,
 ) -> List[int]:
     """
     Sliding-window clip sampling: a clip starts every `stride` source frames
@@ -112,11 +113,16 @@ def compute_clip_starts(
         return []
 
     span = clip_span(config)
+    if total_frames < span:
+        return []
+
     margin = effective_margin(total_frames, config)
 
     usable_start = margin
     usable_end = total_frames - margin
     if usable_end - usable_start < span:
+        if config.min_clips_per_video > 0:
+            return [max(0, (total_frames - span) // 2)]
         return []
 
     starts: List[int] = []
@@ -125,8 +131,12 @@ def compute_clip_starts(
         starts.append(s)
         s += stride
 
-    if config.max_clips_per_video > 0:
-        starts = starts[: config.max_clips_per_video]
+    if not starts and config.min_clips_per_video > 0:
+        starts.append(max(0, (total_frames - span) // 2))
+
+    cap = max_clips if max_clips > 0 else config.max_clips_per_video
+    if cap > 0:
+        starts = starts[:cap]
     return starts
 
 
@@ -137,16 +147,39 @@ def stride_for_label(dataset: str, label: str, config: PreprocessConfig) -> int:
     FF++ real and SiW-Mv2 live are both labelled "real" but are very different
     videos — 840 vs 179 median frames — so they cannot share a stride if the
     two tasks are to stay class-balanced.
+    If allow_clip_overlap is False, stride is clamped to at least clip_span.
     """
     if dataset == config.siw_dataset_name:
-        return (
+        stride = (
             config.clip_stride_live if label == "real"
             else config.clip_stride_spoof
         )
-    return (
-        config.clip_stride_fake if label == "fake"
-        else config.clip_stride_real
-    )
+    else:
+        stride = (
+            config.clip_stride_fake if label == "fake"
+            else config.clip_stride_real
+        )
+    if not config.allow_clip_overlap:
+        stride = max(stride, clip_span(config))
+    return stride
+
+
+def max_clips_for_label(dataset: str, label: str, config: PreprocessConfig) -> int:
+    """
+    Get max clips allowed per video for a specific dataset and label.
+    Falls back to config.max_clips_per_video if specific setting is None.
+    """
+    if dataset == config.siw_dataset_name:
+        specific = (
+            config.max_clips_siw_live if label == "real"
+            else config.max_clips_siw_spoof
+        )
+    else:
+        specific = (
+            config.max_clips_ff_fake if label == "fake"
+            else config.max_clips_ff_real
+        )
+    return specific if specific is not None else config.max_clips_per_video
 
 
 # =========================================================================== #
@@ -246,8 +279,7 @@ def extract_clip(
     if window is None:
         return []
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    records: List[Dict] = []
+    valid_crops: List[Tuple[int, int, np.ndarray]] = []
     saved_idx = 0
 
     for (src_idx, bgr), bbox in zip(raw_frames, per_frame_bbox):
@@ -260,26 +292,32 @@ def extract_clip(
         if crop.size == 0:
             continue
 
-        save_path = out_dir / f"c{clip_idx}_f{saved_idx:03d}.jpg"
+        valid_crops.append((src_idx, saved_idx, crop))
+        saved_idx += 1
+
+    if len(valid_crops) < config.min_valid_frames:
+        logger.debug(
+            "Clip %d: only %d valid frames after window filtering → reject",
+            clip_idx, len(valid_crops),
+        )
+        return []
+
+    # Quality gate passed: create output directory and write files to disk
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, config.jpeg_quality]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records: List[Dict] = []
+
+    for src_idx, s_idx, crop in valid_crops:
+        save_path = out_dir / f"c{clip_idx}_f{s_idx:03d}.jpg"
         cv2.imwrite(str(save_path), crop, encode_params)
 
         records.append({
             "frame_path": str(save_path),
             "clip_index": clip_idx,
-            "frame_num": saved_idx,
+            "frame_num": s_idx,
             "src_frame_idx": src_idx,
             "clip_start_frame": start_frame,
         })
-        saved_idx += 1
-
-    if len(records) < config.min_valid_frames:
-        logger.debug(
-            "Clip %d: only %d valid frames after window filtering → reject",
-            clip_idx, len(records),
-        )
-        for rec in records:
-            Path(rec["frame_path"]).unlink(missing_ok=True)
-        return []
 
     return records
 # =========================================================================== #
@@ -422,7 +460,8 @@ def process_video(
         return []
 
     stride = stride_for_label(dataset, label, config)
-    clip_starts = compute_clip_starts(total_frames, stride, config)
+    max_clips = max_clips_for_label(dataset, label, config)
+    clip_starts = compute_clip_starts(total_frames, stride, config, max_clips=max_clips)
 
     if not clip_starts:
         logger.warning("Too short (%d frames): %s", total_frames, video_path)
@@ -737,23 +776,30 @@ def run_pipeline(cfg: Config) -> None:
         " (adaptive)" if config.adaptive_margin else "",
     )
     logger.info(
-        "Stride (start-to-start): ff_real=%d ff_fake=%d siw_live=%d siw_spoof=%d"
-        " | max_clips/video=%s",
-        config.clip_stride_real, config.clip_stride_fake,
-        config.clip_stride_live, config.clip_stride_spoof,
+        "Sampling: allow_overlap=%s | min_clips/vid=%d | max_clips/vid=%s"
+        " (ff_real=%s, ff_fake=%s, siw_live=%s, siw_spoof=%s)",
+        config.allow_clip_overlap,
+        config.min_clips_per_video,
         config.max_clips_per_video or "unlimited",
+        config.max_clips_ff_real if config.max_clips_ff_real is not None else "default",
+        config.max_clips_ff_fake if config.max_clips_ff_fake is not None else "default",
+        config.max_clips_siw_live if config.max_clips_siw_live is not None else "default",
+        config.max_clips_siw_spoof if config.max_clips_siw_spoof is not None else "default",
     )
-    # Overlap is the part of the stride story that silently changes the data:
-    # a stride below the clip span produces clips that share frames.
-    overlaps = {
-        "ff_real": span - config.clip_stride_real,
-        "ff_fake": span - config.clip_stride_fake,
-        "siw_live": span - config.clip_stride_live,
-        "siw_spoof": span - config.clip_stride_spoof,
+    strides = {
+        "ff_real": stride_for_label(config.ff_dataset_name, "real", config),
+        "ff_fake": stride_for_label(config.ff_dataset_name, "fake", config),
+        "siw_live": stride_for_label(config.siw_dataset_name, "real", config),
+        "siw_spoof": stride_for_label(config.siw_dataset_name, "spoof", config),
     }
     logger.info(
+        "Effective strides: %s",
+        " ".join(f"{k}={v}" for k, v in strides.items()),
+    )
+    overlaps = {k: max(0, span - v) for k, v in strides.items()}
+    logger.info(
         "Clip overlap (shared frames): %s",
-        " ".join(f"{k}={max(0, v)}" for k, v in overlaps.items()),
+        " ".join(f"{k}={v}" for k, v in overlaps.items()),
     )
     logger.info(
         "Quality gate: score>=%.2f | window IoU>=%.2f | min_valid=%d",

@@ -141,9 +141,28 @@ class PreprocessConfig:
     clip_stride_live:  int = 120          # SiW-Mv2 live (no overlap)
     clip_stride_spoof: int = 45           # SiW-Mv2 spoof (19f overlap: short videos)
 
+    # Disallow overlapping frames between clips extracted from the same video.
+    # If False, strides < span (e.g. spoof=45) will produce overlapping clips.
+    # If True, effective stride is clamped to at least clip_span (64), guaranteeing
+    # that every 64-frame clip extracted from a video contains unique non-overlapping frames.
+    allow_clip_overlap: bool = False
+
+    # Minimum clips to extract per video if total_frames >= frames_per_clip.
+    # Ensures every video in the dataset contributes at least 1 clip if long enough.
+    min_clips_per_video: int = 1
+
     # Hard cap on clips per video. 0 = no cap, keep every clip the stride finds.
-    # Use a small value to stop long videos from dominating their class.
-    max_clips_per_video: int = 0
+    # Set to 1 to extract at least/most 1 clip per video, or > 1 for multiple clips.
+    max_clips_per_video: int = 1
+
+    # Per-dataset and per-label clip caps for perfect dataset balancing across MTL heads:
+    # - FaceForensics++ (200 vids/class, ~800 frames each): 4 clips -> ~750-800 balanced clips
+    # - SiW-Mv2 (800-900 vids/class, ~160 frames each): 1 clip -> ~750-800 balanced clips
+    # This guarantees 1:1 balance for both Deepfake (FF) and Anti-Spoof (SiW) heads with 0 frame overlap.
+    max_clips_ff_real: Optional[int] = 4
+    max_clips_ff_fake: Optional[int] = 4
+    max_clips_siw_live: Optional[int] = 1
+    max_clips_siw_spoof: Optional[int] = 1
 
     # ── Quality gate ──────────────────────────────────────────────────────────
     min_face_score: float = 0.65          # InsightFace det_score threshold
