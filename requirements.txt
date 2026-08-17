@@ -9,3 +9,17 @@ timm==1.0.27
 scikit-learn==1.8.0
 scipy==1.17.1
 tqdm==4.67.3
+
+# Face detection / alignment (preprocessing + demo)
+insightface==1.0.1
+# GPU build: InsightFace then runs on CUDAExecutionProvider (~1.5x faster
+# preprocessing with parallel workers, much faster per video). The two packages
+# conflict — install exactly one. On a machine without an NVIDIA GPU use:
+#   pip uninstall onnxruntime-gpu && pip install onnxruntime==1.28.0
+onnxruntime-gpu==1.28.0
+
+# Power / energy monitoring (src/utils/power_utils.py).
+# Both are optional: PowerMonitor degrades to RAM estimates and nvidia-smi
+# polling if they are absent, but installing them is more accurate and cheaper.
+psutil==7.2.2
+nvidia-ml-py==13.610.43

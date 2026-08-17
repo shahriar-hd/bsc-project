@@ -27,10 +27,12 @@ from torchvision import transforms
 from insightface.app import FaceAnalysis
 
 from src.config import get_config
+from src.utils.face_utils import FaceDetector
 
 # ── globals ───────────────────────────────────────────────────────────────────
 
-cfg = get_config().demo
+_full_cfg = get_config()
+cfg = _full_cfg.demo
 
 TRANSFORM = transforms.Compose([
     transforms.ToTensor(),
@@ -66,13 +68,23 @@ def save_run_metadata(run_dir: Path, data: dict) -> None:
 
 # ── InsightFace ───────────────────────────────────────────────────────────────
 
-def get_face_app() -> FaceAnalysis:
-    app = FaceAnalysis(
-        name=cfg.paths.buffalo_model,
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+def get_face_detector() -> FaceDetector:
+    """
+    Shared detector with the recognition module enabled — the demo needs
+    `normed_embedding` for identity matching, unlike preprocessing.
+    """
+    return FaceDetector(
+        _full_cfg.preprocess,
+        need_embeddings=True,
+        det_name=cfg.paths.buffalo_model,
     )
-    app.prepare(ctx_id=0, det_size=(640, 640))
-    return app
+
+
+def get_face_app() -> FaceAnalysis:
+    """Underlying FaceAnalysis session (kept: call sites use `face_app.get`)."""
+    detector = get_face_detector()
+    detector._ensure_app()
+    return detector.app
 
 
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:

@@ -42,55 +42,11 @@ from scipy.interpolate import interp1d
 from tqdm import tqdm
 
 from src.config import Config, get_config
+from src.utils.logger_utils import log_banner, setup_logger
+from src.utils.power_utils import GPUSample, PowerMonitor, power_monitor_from_config
+from src.utils.repro_utils import set_seed, worker_init_fn
 
 warnings.filterwarnings("ignore")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging Setup
-# ──────────────────────────────────────────────────────────────────────────────
-
-def setup_logger(log_path: str) -> logging.Logger:
-    """Configure pretty console + file logger."""
-    logger = logging.getLogger("MTL")
-    logger.setLevel(logging.DEBUG)
-    fmt = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    # File handler
-    fh = logging.FileHandler(log_path)
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-
-    logger.addHandler(ch)
-    logger.addHandler(fh)
-    return logger
-
-
-def log_banner(logger: logging.Logger, text: str) -> None:
-    """Print a section banner to logger."""
-    sep = "─" * 60
-    logger.info(sep)
-    logger.info(f"  {text}")
-    logger.info(sep)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Reproducibility
-# ──────────────────────────────────────────────────────────────────────────────
-
-def set_seed(seed: int) -> None:
-    """Set all random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -111,269 +67,6 @@ def get_last_run_id(checkpoint_root: str) -> Optional[str]:
     """Return most recent run folder or None."""
     existing = sorted(glob.glob(os.path.join(checkpoint_root, "run*")))
     return os.path.basename(existing[-1]) if existing else None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Power Monitor
-# ──────────────────────────────────────────────────────────────────────────────
-# ─── REPLACE the existing PowerMonitor class in train.py ─────────────────────
-
-import threading
-import time
-import subprocess
-import re
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
-
-
-@dataclass
-class GPUSample:
-    """Single power sample for one GPU device."""
-    gpu_id: int
-    power_w: float
-    timestamp: float
-
-
-class PowerMonitor:
-    """
-    Background thread that polls CPU (RAPL), RAM, and one or more CUDA GPUs.
-
-    Supports single and multi-GPU setups. Per-GPU power is collected via
-    `nvidia-smi`. CPU power is read from the Intel RAPL sysfs interface.
-
-    Args:
-        poll_interval: seconds between samples
-        rapl_path: sysfs path prefix for Intel RAPL
-        ram_coeff: W per GB of system RAM (estimate)
-        ssd_coeff: W for SSD activity (estimate)
-        other_coeff: W for misc board components (estimate)
-        gpu_ids: list of CUDA device indices to monitor; empty = all visible
-        per_gpu_log: if True, store per-GPU breakdown alongside aggregates
-    """
-
-    def __init__(
-        self,
-        poll_interval: float = 5.0,
-        rapl_path: str = "/sys/class/powercap/intel-rapl",
-        ram_coeff: float = 0.375,
-        ssd_coeff: float = 2.0,
-        other_coeff: float = 5.0,
-        gpu_ids: Optional[List[int]] = None,
-        per_gpu_log: bool = True,
-    ) -> None:
-        self.poll_interval = poll_interval
-        self.rapl_path = rapl_path
-        self.ram_coeff = ram_coeff
-        self.ssd_coeff = ssd_coeff
-        self.other_coeff = other_coeff
-        self.per_gpu_log = per_gpu_log
-
-        # Resolve which GPU indices to monitor
-        self._gpu_ids: List[int] = self._resolve_gpu_ids(gpu_ids)
-
-        # Accumulated samples
-        self._samples: List[float] = []                        # total system power (W)
-        self._gpu_samples: Dict[int, List[float]] = {          # per-GPU (W)
-            gid: [] for gid in self._gpu_ids
-        }
-
-        self._lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-        # Energy counters (kWh)
-        self.total_energy_kwh: float = 0.0
-        self.gpu_energy_kwh: Dict[int, float] = {gid: 0.0 for gid in self._gpu_ids}
-
-    # ── helpers ──────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _resolve_gpu_ids(requested: Optional[List[int]]) -> List[int]:
-        """Return validated GPU indices, falling back to all visible devices."""
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=5
-            )
-            available = [int(x.strip()) for x in result.stdout.strip().splitlines()]
-        except Exception:
-            available = []
-
-        if not available:
-            return []
-        if not requested:
-            return available
-        return [g for g in requested if g in available]
-
-    def _read_rapl_watts(self) -> float:
-        """Read CPU package power from Intel RAPL sysfs. Returns 0.0 on failure."""
-        total = 0.0
-        try:
-            import os
-            for entry in os.scandir(self.rapl_path):
-                name_file = os.path.join(entry.path, "name")
-                energy_file = os.path.join(entry.path, "energy_uj")
-                if not (os.path.exists(name_file) and os.path.exists(energy_file)):
-                    continue
-                with open(name_file) as f:
-                    name = f.read().strip()
-                if "package" not in name:
-                    continue
-                with open(energy_file) as f:
-                    uj1 = int(f.read().strip())
-                time.sleep(0.1)
-                with open(energy_file) as f:
-                    uj2 = int(f.read().strip())
-                total += max(0, uj2 - uj1) / 1e5  # µJ over 0.1 s → W
-        except Exception:
-            pass
-        return total
-
-    def _read_gpu_watts(self) -> Dict[int, float]:
-        """
-        Query nvidia-smi for instantaneous power draw of each monitored GPU.
-
-        Returns a dict {gpu_id: watts}. Missing entries default to 0.0.
-        """
-        result: Dict[int, float] = {gid: 0.0 for gid in self._gpu_ids}
-        if not self._gpu_ids:
-            return result
-        try:
-            output = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=index,power.draw",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True, text=True, timeout=5
-            ).stdout.strip()
-
-            for line in output.splitlines():
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) < 2:
-                    continue
-                try:
-                    gid = int(parts[0])
-                    watts = float(parts[1])
-                    if gid in result:
-                        result[gid] = watts
-                except ValueError:
-                    continue
-        except Exception:
-            pass
-        return result
-
-    def _estimate_system_overhead(self) -> float:
-        """Estimate non-GPU, non-CPU power (RAM + SSD + board)."""
-        try:
-            import psutil
-            ram_gb = psutil.virtual_memory().total / 1e9
-        except Exception:
-            ram_gb = 8.0
-        return ram_gb * self.ram_coeff + self.ssd_coeff + self.other_coeff
-
-    # ── main loop ─────────────────────────────────────────────────────────────
-
-    def _poll(self) -> None:
-        """Background polling loop — runs in a daemon thread."""
-        while not self._stop_event.is_set():
-            cpu_w = self._read_rapl_watts()
-            gpu_w = self._read_gpu_watts()
-            overhead_w = self._estimate_system_overhead()
-
-            total_gpu_w = sum(gpu_w.values())
-            total_w = cpu_w + total_gpu_w + overhead_w
-
-            with self._lock:
-                self._samples.append(total_w)
-                for gid, w in gpu_w.items():
-                    self._gpu_samples[gid].append(w)
-
-                # Accumulate energy: P(W) × interval(h) = Wh
-                kwh_increment = total_w * self.poll_interval / 3_600_000
-                self.total_energy_kwh += kwh_increment
-                for gid, w in gpu_w.items():
-                    self.gpu_energy_kwh[gid] += w * self.poll_interval / 3_600_000
-
-            self._stop_event.wait(self.poll_interval)
-
-    # ── public API ────────────────────────────────────────────────────────────
-
-    def start(self) -> None:
-        """Start background power monitoring thread."""
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._poll, daemon=True, name="PowerMonitor")
-        self._thread.start()
-
-    def stop(self) -> None:
-        """Stop monitoring thread and wait for it to finish."""
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self.poll_interval + 2)
-
-    def summary(self) -> Dict:
-        """
-        Return a summary dict with total and per-GPU statistics.
-
-        Keys
-        ----
-        mean_power_w        : float — average total system power
-        total_energy_kwh    : float — total energy consumed
-        total_co2_kg        : float — CO₂ estimate (0.494 kg/kWh, EU avg)
-        num_gpus_monitored  : int
-        gpu_ids             : list[int]
-        per_gpu             : dict[int, dict] — per-GPU mean_w and energy_kwh
-        """
-        with self._lock:
-            samples = list(self._samples)
-            gpu_samples = {gid: list(v) for gid, v in self._gpu_samples.items()}
-            total_energy = self.total_energy_kwh
-            gpu_energy = dict(self.gpu_energy_kwh)
-
-        mean_total = sum(samples) / len(samples) if samples else 0.0
-        co2_kg = total_energy * 0.494  # IPCC/IEA grid average
-
-        per_gpu: Dict[int, Dict] = {}
-        if self.per_gpu_log:
-            for gid in self._gpu_ids:
-                s = gpu_samples.get(gid, [])
-                per_gpu[gid] = {
-                    "mean_power_w": sum(s) / len(s) if s else 0.0,
-                    "energy_kwh": gpu_energy.get(gid, 0.0),
-                    "co2_kg": gpu_energy.get(gid, 0.0) * 0.494,
-                }
-
-        return {
-            "mean_power_w": mean_total,
-            "total_energy_kwh": total_energy,
-            "total_co2_kg": co2_kg,
-            "num_gpus_monitored": len(self._gpu_ids),
-            "gpu_ids": list(self._gpu_ids),
-            "per_gpu": per_gpu,
-        }
-
-    def log_summary(self, logger=None) -> None:
-        """Print (or log) a human-readable power summary."""
-        s = self.summary()
-        lines = [
-            "─" * 52,
-            f"  Power & Energy Summary",
-            f"  Mean system power  : {s['mean_power_w']:.1f} W",
-            f"  Total energy       : {s['total_energy_kwh']:.4f} kWh",
-            f"  Estimated CO₂      : {s['total_co2_kg']:.4f} kg",
-            f"  GPUs monitored     : {s['num_gpus_monitored']} {s['gpu_ids']}",
-        ]
-        for gid, info in s["per_gpu"].items():
-            lines.append(
-                f"    GPU {gid}: {info['mean_power_w']:.1f} W avg, "
-                f"{info['energy_kwh']:.4f} kWh, {info['co2_kg']:.4f} kg CO₂"
-            )
-        lines.append("─" * 52)
-        msg = "\n".join(lines)
-        if logger:
-            logger.info(msg)
-        else:
-            print(msg)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1496,17 +1189,27 @@ class Trainer:
                 f"patience={tc.early_stopping_patience}"
             )
 
-        # ── Power monitor ─────────────────────────────────────────────
+        # ── Power monitor (shared with preprocessing.py) ──────────────
         pc = cfg.power
-        self.power_monitor = PowerMonitor(
-            poll_interval=pc.poll_interval_sec,
-            rapl_path=pc.rapl_path,
-            ram_coeff=pc.ram_coeff,
-            ssd_coeff=pc.ssd_coeff,
-            other_coeff=pc.other_coeff,
-            gpu_ids=(pc.gpu_ids if pc.gpu_ids else self.gpu_ids) if pc.monitor_all_gpus else [],
-            per_gpu_log=pc.per_gpu_log,
+        self.power_monitor = power_monitor_from_config(
+            cfg,
+            csv_path=os.path.join(self.run_dir, "power_train.csv"),
         )
+        # Restrict to the GPUs this run actually trains on, unless the config
+        # names an explicit set.
+        if pc.monitor_all_gpus and not pc.gpu_ids and self.gpu_ids:
+            self.power_monitor = PowerMonitor(
+                poll_interval=pc.poll_interval_sec,
+                rapl_path=pc.rapl_path,
+                ram_coeff=pc.ram_coeff,
+                ssd_coeff=pc.ssd_coeff,
+                other_coeff=pc.other_coeff,
+                gpu_ids=self.gpu_ids,
+                per_gpu_log=pc.per_gpu_log,
+                co2_kg_per_kwh=pc.co2_kg_per_kwh,
+                overhead_multiplier=pc.overhead_multiplier,
+                csv_path=os.path.join(self.run_dir, "power_train.csv"),
+            )
 
         # ── Mutable state ─────────────────────────────────────────────
         self.start_epoch  = 0
@@ -2114,7 +1817,7 @@ def main():
     log_path = os.path.join(cfg.paths.checkpoint_dir, cfg.paths.log_file)
     os.makedirs(cfg.paths.checkpoint_dir, exist_ok=True)
 
-    logger = setup_logger(log_path)
+    logger = setup_logger(log_path, cfg=cfg)
     set_seed(cfg.train.seed)
 
     log_banner(logger, "MTL Training: Deepfake | Anti-Spoof | Temporal")

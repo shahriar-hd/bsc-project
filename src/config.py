@@ -24,7 +24,7 @@ from typing import List, Optional, Tuple
 class PreprocessConfig:
     # ── Paths ─────────────────────────────────────────────────────────────────
     raw_data_root: Path = Path(
-        "/home/shahriar/Documents/bank_did_auth/data/datasets/raw"
+        "/home/shahriar/Documents/bsc-project/data/datasets/raw"
     )
     processed_root: Path = Path(
         "/home/shahriar/Documents/bsc-project/data/datasets/processed"
@@ -61,13 +61,22 @@ class PreprocessConfig:
         "Silicone",
     ])
 
+    # ── CSV output directory (must match PathConfig.csv_root) ─────────────────
+    csv_dir: Path = Path(
+        "/home/shahriar/Documents/bsc-project/data/datasets/processed/csv"
+    )
+
     # ── Video extensions to scan ──────────────────────────────────────────────
     video_extensions: Tuple[str, ...] = (".mp4", ".avi", ".mov", ".mkv")
 
-    # ── InsightFace / Buffalo_L ───────────────────────────────────────────────
+    # ── InsightFace ───────────────────────────────────────────────────────────
+    # buffalo_l  → detection + 512-d recognition embedding (demo app: identity)
+    # buffalo_sc → detection only, ~3x faster (preprocessing: quality gate)
     insightface_model_name: str = "buffalo_l"
+    insightface_det_model: str = "buffalo_sc"
     insightface_ctx_id: int = 0           # GPU id; -1 for CPU
     insightface_det_size: Tuple[int, int] = (640, 640)
+    insightface_modules: List[str] = field(default_factory=lambda: ["detection"])
 
     # ── Face crop & output image ──────────────────────────────────────────────
     output_face_size: int = 224           # final square crop (px)
@@ -87,19 +96,6 @@ class PreprocessConfig:
     # new position as genuine subject motion.
     bbox_jitter_tolerance: int = 3
 
-    # ── Frame sampling ────────────────────────────────────────────────────────
-    # Target clip length (number of frames per clip stored in CSV).
-    t_clip: int = 64
-
-    # Skip every N source frames before sampling a clip frame.
-    # At 30 fps: skip=2 → effective 10 fps input to clip.
-    # At 60 fps: skip=4 → same effective rate.
-    frame_skip: int = 2
-
-    # Minimum frames that must be extracted from a video for it to be
-    # included in the dataset.
-    min_frames_per_video: int = 8
-
     # ── Train / Val / Test split ratios (must sum to 1.0) ─────────────────────
     train_ratio: float = 0.70
     val_ratio: float = 0.15
@@ -111,22 +107,86 @@ class PreprocessConfig:
     # ── Misc ──────────────────────────────────────────────────────────────────
     log_every_n_videos: int = 20          # progress log interval
     jpeg_quality: int = 92                # 90-95: sharp enough, ~3× smaller than PNG
-    frames_per_clip: int = 64
-    min_valid_frames: int = 48
-    min_face_score: float = 0.65
 
-    # clip sampling
+    # ── Clip sampling ─────────────────────────────────────────────────────────
+    # A clip is `frames_per_clip` frames taken every `frame_skip` source frames,
+    # so it spans  (frames_per_clip - 1) * frame_skip + 1  source frames.
     frames_per_clip: int = 64
-    clip_stride_real:  int = 120
-    clip_stride_fake:  int = 50
-    clip_stride_spoof: int = 20
-    max_clips_siw: int = 1
 
-    # quality gate
-    min_face_score: float = 0.65
-    min_valid_frames: int = 48
-    margin: int = 25
-    disp_ratio: float = 0.30
+    # Temporal subsampling *inside* a clip. 1 = every source frame.
+    # Keep at 1: SiW-Mv2 videos are short (median 150 frames), and skip=2 would
+    # make one clip span 127 source frames, dropping most SiW videos entirely.
+    frame_skip: int = 1
+
+    # Distance between the START of consecutive clips in the same video, in
+    # source frames (sliding-window stride):
+    #   stride >  clip span → clips are separated by (stride - span) frames
+    #   stride == clip span → clips are back-to-back, no shared frames
+    #   stride <  clip span → clips overlap and share (span - stride) frames
+    #
+    # Tuned on the measured frame-count distribution of the two datasets so
+    # that each task's own classes are balanced (that is what the deepfake BCE
+    # and the spoof focal loss actually see) and both datasets contribute a
+    # comparable number of clips (ff_sample_ratio=1.0 assumes this):
+    #
+    #   FF++  real  200 videos, median 840 frames → ~1328 clips
+    #   FF++  fake  200 videos, median 703 frames → ~1297 clips   (ratio 1.02)
+    #   SiW   live  785 videos, median 179 frames → ~1260 clips
+    #   SiW   spoof 915 videos, median 150 frames → ~1263 clips   (ratio 1.00)
+    #
+    # FF++ real and SiW live are both labelled "real" but need different
+    # strides (840 vs 179 median frames), hence two separate values.
+    clip_stride_real:  int = 120          # FF++ real  (no overlap, 56f gap)
+    clip_stride_fake:  int = 100          # FF++ fake  (no overlap, 36f gap)
+    clip_stride_live:  int = 120          # SiW-Mv2 live (no overlap)
+    clip_stride_spoof: int = 45           # SiW-Mv2 spoof (19f overlap: short videos)
+
+    # Hard cap on clips per video. 0 = no cap, keep every clip the stride finds.
+    # Use a small value to stop long videos from dominating their class.
+    max_clips_per_video: int = 0
+
+    # ── Quality gate ──────────────────────────────────────────────────────────
+    min_face_score: float = 0.65          # InsightFace det_score threshold
+    min_valid_frames: int = 48            # min surviving frames for a clip to count
+    disp_ratio: float = 0.30              # min IoU(face, clip window) to keep a frame
+    margin: int = 25                      # frames skipped at video head/tail
+
+    # Shrink `margin` on short videos instead of rejecting them: a fixed 25-frame
+    # margin at both ends costs 50 of a 150-frame SiW video, which dropped 168
+    # SiW videos (125 spoof + 43 live) that are otherwise perfectly usable.
+    # Effective margin = min(margin, (total_frames - clip_span) // 4).
+    adaptive_margin: bool = True
+
+    # ── Parallelism ───────────────────────────────────────────────────────────
+    # Worker processes for video extraction. Each worker runs its own
+    # InsightFace/ONNX session, so both GPU memory and RAM scale with it.
+    #   0 = auto-size from free GPU memory, available RAM and core count
+    #   1 = sequential, everything in the parent process (easiest to debug)
+    num_workers: int = 0
+    # Measured on a 4 GB RTX 3050 Ti (12 videos, 1326 frames): 1 worker 23.2s,
+    # 3 workers 14.8s, 4 workers 14.7s, 6 workers 15.3s. Detection on one GPU
+    # is the bottleneck, so past 4 workers contention costs more than it gains.
+    max_workers: int = 4
+
+    # Per-worker ONNX CUDA arena limit. det_500m at 640x640 needs very little;
+    # the cost is mostly the ~300 MB CUDA context each process creates.
+    worker_gpu_mem_mb: int = 256
+
+    # Threads *inside* each worker. Left at 1-2 on purpose: N workers each
+    # spawning 16 OpenCV threads oversubscribes the CPU and runs slower than
+    # the sequential version. `worker_omp_threads` is exported as
+    # OMP_NUM_THREADS before the ONNX session is built.
+    worker_cv_threads: int = 2
+    worker_omp_threads: int = 2
+
+    # RAM budget per worker (MB). A worker buffers `frames_per_clip` decoded
+    # frames; 64 x 1080p BGR is ~400 MB, so this is what actually limits the
+    # worker count on a 16 GB machine.
+    worker_ram_mb: int = 900
+
+    # ── Power monitoring ──────────────────────────────────────────────────────
+    monitor_power: bool = True
+    power_log_csv: str = "power_preprocess.csv"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Paths  (training artefacts)
@@ -339,10 +399,30 @@ class PowerConfig:
     # RAPL paths (Linux) TODO: run <sudo chmod -R a+r /sys/class/powercap/intel-rapl> in cli first
     rapl_path: str = "/sys/class/powercap/intel-rapl"
 
+    # ── Emission factor ──────────────────────────────────────────────────────
+    # kg CO₂ per kWh. 0.494 = Iran grid average (also close to EU average).
+    co2_kg_per_kwh: float = 0.494
+    # Accounts for PSU losses and components not covered by RAPL/nvidia-smi.
+    overhead_multiplier: float = 1.15
+
     # ── Multi-GPU power monitoring ───────────────────────────────────────────
     monitor_all_gpus: bool = True      # track every visible CUDA device
     gpu_ids: list = field(default_factory=lambda: [])  # empty = all visible GPUs
     per_gpu_log: bool = True           # include per-GPU breakdown in output
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Logging
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class LogConfig:
+    """Shared logger settings (train / preprocessing / demo)."""
+    console_level: str = "INFO"        # level for stdout handler
+    file_level: str = "DEBUG"          # level for file handler
+    fmt: str = "%(asctime)s | %(levelname)-7s | %(message)s"
+    datefmt: str = "%Y-%m-%d %H:%M:%S"
+    banner_width: int = 60
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -409,6 +489,7 @@ class Config:
     aug: AugConfig = field(default_factory=AugConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     power: PowerConfig = field(default_factory=PowerConfig)
+    log: LogConfig = field(default_factory=LogConfig)
     demo: DemoConfig = field(default_factory=DemoConfig)
 
     # Runtime (set automatically)
