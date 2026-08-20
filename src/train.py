@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 
@@ -88,9 +89,12 @@ def build_transforms(cfg: Config, is_train: bool) -> A.Compose:
                 hue=ac.hue_jitter, p=0.5
             ),
             A.GaussianBlur(p=ac.gaussian_blur_p),
+            # albumentations >= 2.0 replaced quality_lower/quality_upper with
+            # quality_range. The old kwargs are silently ignored (UserWarning
+            # only) and the transform falls back to quality_range=(99, 100),
+            # which makes JPEG augmentation a no-op — it has to be the tuple.
             A.ImageCompression(
-                quality_lower=ac.jpeg_quality_min,
-                quality_upper=ac.jpeg_quality_max,
+                quality_range=(ac.jpeg_quality_min, ac.jpeg_quality_max),
                 p=ac.jpeg_compression_p
             ),
             A.CoarseDropout(p=ac.coarse_dropout_p),
@@ -184,13 +188,17 @@ class MTLDataset(Dataset):
         clip = self.clips[idx]
         frame_paths = self._sample_frames(clip["frame_paths"])
 
-        frames = []
-        for fp in frame_paths:
-            img = self._load_frame(fp)
-            aug = self.transform(image=img)["image"]
-            frames.append(aug)
+        # One augmentation drawn per *clip*, not per frame. Albumentations'
+        # `images` target applies identical parameters to every frame in the
+        # list, so the flip/rotation/jitter is shared across the whole clip.
+        # Augmenting each frame independently would inject artificial
+        # frame-to-frame inconsistency — exactly the signal the temporal head is
+        # supposed to measure — and would spatially misalign the frames that TSM
+        # shifts channels between.
+        imgs = [self._load_frame(fp) for fp in frame_paths]
+        frames = self.transform(images=imgs)["images"]
 
-        frames_tensor = torch.stack(frames, dim=0)
+        frames_tensor = torch.stack(list(frames), dim=0)
 
         # ── Task-specific labels ──────────────────────────────────
         task = clip["task"]
@@ -464,6 +472,12 @@ class MTLModel(nn.Module):
         self.T = cfg.train.num_frames
         self.use_tsm = mc.use_tsm
         self.tsm_shift_ratio = mc.tsm_shift_ratio
+        self.tsm_blocks = tuple(getattr(mc, "tsm_block_indices", (1, 3, 5)))
+        # Recompute block activations during backward instead of storing them.
+        # PCGrad backwards the graph once per task and GradNorm adds a
+        # double-backward pass, so stored activations are the dominant VRAM cost
+        # on a small card. Trades ~30% step time for a large memory saving.
+        self.grad_checkpointing = getattr(mc, "grad_checkpointing", False)
 
         # Shared backbone
         self.backbone = timm.create_model(
@@ -499,6 +513,40 @@ class MTLModel(nn.Module):
             self.log_weights.copy_(torch.log(weights / weights.mean() + 1e-8))
 
 
+    def forward_backbone(self, x: torch.Tensor, T: int) -> torch.Tensor:
+        """Forward through EfficientNet backbone with intermediate TSM on feature maps.
+
+        TSM is applied to the *feature maps* entering blocks 1/3/5 (16/48/120
+        channels on EfficientNet-B2), never to the raw 3-channel RGB input —
+        shifting raw pixel channels would swap colour planes between adjacent
+        frames rather than mixing temporal context.
+
+        `act1`/`act2` are absent in timm >= 1.0, where the activation is fused
+        into the BatchNormAct2d layers, so both are guarded by hasattr.
+        """
+        if not hasattr(self.backbone, "blocks"):
+            return self.backbone(x)
+
+        x = self.backbone.conv_stem(x)
+        x = self.backbone.bn1(x)
+        if hasattr(self.backbone, "act1"):
+            x = self.backbone.act1(x)
+
+        for i, block in enumerate(self.backbone.blocks):
+            if self.use_tsm and i in self.tsm_blocks:
+                x = apply_tsm(x, self.tsm_shift_ratio, T)
+            if self.grad_checkpointing and self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+
+        x = self.backbone.conv_head(x)
+        x = self.backbone.bn2(x)
+        if hasattr(self.backbone, "act2"):
+            x = self.backbone.act2(x)
+        x = self.backbone.global_pool(x)
+        return x
+
     def forward(
         self,
         frames: torch.Tensor,          # (B, T, C, H, W)
@@ -506,10 +554,7 @@ class MTLModel(nn.Module):
         B, T, C, H, W = frames.shape
         x = frames.view(B * T, C, H, W)
 
-        if self.use_tsm:
-            x = apply_tsm(x, self.tsm_shift_ratio, T)
-
-        feats = self.backbone(x)       # (B*T, D)
+        feats = self.forward_backbone(x, T)       # (B*T, D)
         feats = feats.view(B, T, -1)  # (B, T, D)
 
         frame_feat = feats.mean(dim=1)  # (B, D) — temporal pooled
@@ -521,17 +566,14 @@ class MTLModel(nn.Module):
         temp_logit = temp_out["temp_logit"]
 
         return {
-   		 "deepfake_logit":         df_logit,
-   		 "spoof_logit":         sp_logit,
-  		  "temp_logit":       temp_logit,
-    		"temp_proj":        temp_proj,
-    		"pseudo_label":     temp_out.get("pseudo_label"),
-   		 "flow_consistency": temp_out.get("flow_consistency"),
-    		"feats":            feats,
-		}
-
-
-
+            "deepfake_logit":   df_logit,
+            "spoof_logit":      sp_logit,
+            "temp_logit":       temp_logit,
+            "temp_proj":        temp_proj,
+            "pseudo_label":     temp_out.get("pseudo_label"),
+            "flow_consistency": temp_out.get("flow_consistency"),
+            "feats":            feats,
+        }
 # ──────────────────────────────────────────────────────────────────────────────
 # Losses
 # ──────────────────────────────────────────────────────────────────────────────
@@ -555,11 +597,18 @@ class FocalLoss(nn.Module):
 def temporal_consistency_loss(
     proj: torch.Tensor,    # (B, T, H)
     labels: torch.Tensor,  # (B,) binary
+    logit: Optional[torch.Tensor] = None,   # (B,) temporal head classifier logit
+    logit_weight: float = 1.0,
 ) -> torch.Tensor:
     """
     Self-supervised temporal loss:
     real clips -> minimize cosine distance between adjacent frames,
     fake clips -> maximize it.
+
+    The cosine term only reaches `TemporalHead.proj`. `TemporalHead.clf` sits on
+    a separate branch, so passing `logit` is what gives it a gradient — and
+    validate() reports temporal accuracy/AUC on exactly that logit, so without
+    the BCE term those metrics score a randomly-initialised head forever.
     """
     # Adjacent frame cosine similarity: (B, T-1)
     p1 = proj[:, :-1]                         # (B, T-1, H)
@@ -572,6 +621,11 @@ def temporal_consistency_loss(
     fake_mask = (labels == 1).float()
 
     loss = (real_mask * (1 - mean_sim) + fake_mask * (1 + mean_sim)).mean()
+
+    if logit is not None and logit_weight > 0.0:
+        loss = loss + logit_weight * F.binary_cross_entropy_with_logits(
+            logit.flatten(), labels.float().flatten()
+        )
     return loss
 
 
@@ -579,34 +633,7 @@ def temporal_consistency_loss(
 # PCGrad
 # ──────────────────────────────────────────────────────────────────────────────
 
-def pcgrad_step(
-    grads: List[Optional[torch.Tensor]]
-) -> List[Optional[torch.Tensor]]:
-    """
-    PCGrad: project conflicting gradients.
-    grads: list of gradient tensors (one per task), each is a flat vector.
-    Returns list of adjusted gradient vectors.
-    """
-    n = len(grads)
-    valid = [g for g in grads if g is not None]
-    if len(valid) < 2:
-        return grads
 
-    adjusted = [g.clone() if g is not None else None for g in grads]
-
-    for i in range(n):
-        if grads[i] is None:
-            continue
-        for j in range(n):
-            if i == j or grads[j] is None:
-                continue
-            gi, gj = adjusted[i], grads[j]
-            dot = (gi * gj).sum()
-            if dot < 0:
-                # Project out conflicting component
-                adjusted[i] = gi - (dot / (gj.norm() ** 2 + 1e-8)) * gj
-
-    return adjusted
 
 
 def get_flat_grads(
@@ -939,27 +966,38 @@ class GradNormManager:
         # 3. Get current task weights
         weights = self.weights
 
-        # 4. Compute per-task gradient norms w.r.t. shared backbone
-        #    This is expensive: one backward pass per task
-        norms = []
+        # 4. Per-task gradient norms w.r.t. the shared backbone.
+        #    ‖∂(w_i·L_i)/∂θ‖ = w_i·‖∂L_i/∂θ‖ — the task weight is a scalar
+        #    factor, so its gradient path is analytic and does NOT need to run
+        #    through the backbone. Differentiating the norm through θ instead
+        #    (create_graph=True) built a full double-backward graph per task on
+        #    top of the still-retained PCGrad graph, and with gradient
+        #    checkpointing each one also re-ran every block's forward: 3
+        #    backbone-sized graphs alive at once, which OOMs a 4 GB card at the
+        #    first GradNorm step that gets past the L(0) early return.
+        #    Detaching ‖∂L_i/∂θ‖ and multiplying by the live `weights` gives
+        #    the identical gradient w.r.t. log_weights for a fraction of the
+        #    memory.
+        grad_norms = []
         for i in range(self.num_tasks):
-            # Gradient of weighted task loss w.r.t. backbone
             grads = torch.autograd.grad(
-                outputs=losses[i] * weights[i],
+                outputs=losses[i],
                 inputs=trainable_shared,
-                retain_graph=True,
-                create_graph=True,  # needed to backprop through norm
+                # The last task no longer needs the graph — freeing it here
+                # releases the buffers PCGrad retained for us.
+                retain_graph=(i < self.num_tasks - 1),
+                create_graph=False,
                 allow_unused=True,
             )
-            # Compute L2 norm of gradients
-            grad_norms = [g.norm(2) for g in grads if g is not None]
-            if grad_norms:
-                task_norm = torch.stack(grad_norms).norm(2)
-            else:
-                task_norm = torch.tensor(0.0, device=self.device)
-            norms.append(task_norm)
+            sq = torch.zeros((), device=self.device, dtype=torch.float32)
+            for g in grads:
+                if g is not None:
+                    sq = sq + g.detach().float().pow(2).sum()
+            grad_norms.append(sq.sqrt())
+            del grads
 
-        norms = torch.stack(norms)  # (num_tasks,)
+        # weights is live (grad flows to log_weights); the norms are constants.
+        norms = weights * torch.stack(grad_norms).detach()  # (num_tasks,)
 
         # 5. Compute loss ratios: L_i(t) / L_i(0)
         loss_ratios = losses.detach() / (self.initial_losses + 1e-8)
@@ -972,9 +1010,17 @@ class GradNormManager:
         # 7. GradNorm loss: L1 distance between actual and target norms
         gn_loss = F.l1_loss(norms, target_norms.detach())
 
-        # 8. Update log_weights
-        self.optimizer.zero_grad()
-        gn_loss.backward()
+        # 8. Update log_weights.
+        #    Taking the grad explicitly w.r.t. log_weights — rather than
+        #    gn_loss.backward() — keeps GradNorm's update confined to the task
+        #    weights. log_weights is not in the main optimizer's param groups,
+        #    so a stray .backward() here would leave gradient in tensors the
+        #    main optimizer *does* own and get applied at the next accumulation
+        #    boundary. check_train_step.py asserts the resulting backbone .grad
+        #    drift across this call is exactly 0.
+        gn_grad, = torch.autograd.grad(gn_loss, [self.log_weights])
+        self.optimizer.zero_grad(set_to_none=True)
+        self.log_weights.grad = gn_grad
         self.optimizer.step()
 
         # 9. Re-normalize weights around mean=1.0 (cosmetic, for stability)
@@ -985,93 +1031,124 @@ class GradNormManager:
         return self.weights.detach()
 
     def state_dict(self) -> dict:
+        """Everything needed to resume task balancing where it left off.
+
+        `initial_losses` matters as much as the weights: GradNorm's target is
+        each task's loss *relative to its own L(0)*. Re-seeding L(0) from
+        mid-training losses on resume resets every training-rate ratio to ~1,
+        so balancing restarts from a baseline that no longer corresponds to
+        the start of training.
+        """
         return {
-            "log_weights": self.log_weights.data.cpu(),
-            "initial_losses": self.initial_losses.cpu() if self.initial_losses is not None else None,
+            "log_weights": self.log_weights.detach().cpu(),
+            "initial_losses": (None if self.initial_losses is None
+                               else self.initial_losses.detach().cpu()),
             "update_count": self._update_count,
             "optimizer": self.optimizer.state_dict(),
         }
 
     def load_state_dict(self, state: dict) -> None:
-        self.log_weights.data = state["log_weights"].to(self.device)
-        if state["initial_losses"] is not None:
-            self.initial_losses = state["initial_losses"].to(self.device)
+        with torch.no_grad():
+            self.log_weights.copy_(state["log_weights"].to(self.device))
+        init = state.get("initial_losses")
+        self.initial_losses = None if init is None else init.to(self.device)
         self._update_count = state.get("update_count", 0)
         self.optimizer.load_state_dict(state["optimizer"])
 
 
-# ─── REPLACE pcgrad_step function در train.py:571-598 ───────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# PCGrad
+# ──────────────────────────────────────────────────────────────────────────────
 
-def pcgrad_step(
+def compute_pcgrad_grads(
     losses: List[torch.Tensor],
-    optimizer: torch.optim.Optimizer,
-    retain_graph: bool = False,
+    params: List[nn.Parameter],
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    accum_factor: float = 1.0,
+    retain_graph_last: bool = False,
 ) -> None:
     """
     PCGrad: Project Conflicting Gradients.
-
     Reference: Yu et al., "Gradient Surgery for Multi-Task Learning", NeurIPS 2020.
 
-    Computes gradient for each task, projects conflicting gradients onto
-    the normal plane, and applies the conflict-free combined gradient.
+    Computes one gradient per task, projects each onto the normal plane of any
+    task it conflicts with, and *accumulates* the conflict-free sum into
+    ``param.grad`` so it composes with gradient accumulation.
+
+    AMP: the gradients are left multiplied by the scaler's current scale, so the
+    caller must go through ``scaler.unscale_(opt)`` → clip → ``scaler.step(opt)``
+    → ``scaler.update()``. That keeps the scaler's inf/nan detection and dynamic
+    backoff working. Unscaling here instead would silently bypass both, and with
+    float16 the fixed initial scale (65536) overflows often enough that the
+    resulting inf gradients would poison the weights on the first bad step.
+    Projection is unaffected: scaling every gradient by s scales ``dot`` and
+    ``norm()**2`` by s² alike, so the projection coefficient is unchanged.
 
     Args:
-        losses:       list of K task-specific scalar losses
-        optimizer:    the model optimizer (e.g. AdamW)
-        retain_graph: whether to keep computation graph after backward
+        losses:            K task-specific scalar losses (already task-weighted)
+        params:            model parameters to compute gradients for
+        scaler:            active GradScaler, or None when AMP is off
+        accum_factor:      1 / grad_accum_steps
+        retain_graph_last: keep the graph alive after the final task's backward
+                           (needed when GradNorm runs on this step)
     """
     num_tasks = len(losses)
-
-    # 1. Collect parameters from optimizer
-    params = []
-    for group in optimizer.param_groups:
-        for p in group["params"]:
-            if p.requires_grad:
-                params.append(p)
-
-    if not params:
+    trainable_params = [p for p in params if p.requires_grad]
+    if not trainable_params:
         return
 
-    # 2. Compute per-task gradients
+    use_scaler = scaler is not None and scaler.is_enabled()
+
+    # 1. Per-task gradients, flattened into one vector each.
     task_grads = []
-    for i, loss in enumerate(losses):
-        optimizer.zero_grad()
-        loss.backward(retain_graph=True)
+    for k, loss in enumerate(losses):
+        # scaler.scale() both multiplies by the current scale and lazily creates
+        # the scaler's internal scale tensor — unscale_()/step()/update() raise
+        # if that never happened, which is why get_scale() alone is not enough.
+        scaled_loss = scaler.scale(loss) if use_scaler else loss
+        is_last = k == num_tasks - 1
+        grads = torch.autograd.grad(
+            scaled_loss,
+            trainable_params,
+            retain_graph=(not is_last) or retain_graph_last,
+            allow_unused=True,
+        )
+        task_grads.append(torch.cat([
+            g.reshape(-1) if g is not None
+            else torch.zeros(p.numel(), device=p.device, dtype=p.dtype)
+            for g, p in zip(grads, trainable_params)
+        ]))
 
-        # Flatten gradients into a single vector
-        grad_vec = []
-        for p in params:
-            if p.grad is not None:
-                grad_vec.append(p.grad.data.flatten().clone())
-            else:
-                grad_vec.append(torch.zeros(p.numel(), device=p.device, dtype=p.dtype))
-        task_grads.append(torch.cat(grad_vec))
-
-    # 3. Project conflicting gradients
-    #    For each pair (i, j): if dot(g_i, g_j) < 0, project g_i
+    # 2. Project conflicting gradients onto each other's normal plane.
     pc_grads = [g.clone() for g in task_grads]
-
     for i in range(num_tasks):
         for j in range(num_tasks):
             if i == j:
                 continue
-            dot_product = torch.dot(pc_grads[i], task_grads[j])
-            if dot_product < 0:
-                # Project g_i onto plane normal to g_j
-                proj_component = dot_product / (task_grads[j].norm() ** 2 + 1e-8)
-                pc_grads[i] = pc_grads[i] - proj_component * task_grads[j]
+            dot = torch.dot(pc_grads[i], task_grads[j])
+            if dot < 0:
+                coeff = dot / (task_grads[j].norm() ** 2 + 1e-8)
+                # add_(alpha=) instead of `- coeff * g` avoids materialising a
+                # second full-size gradient vector per projection.
+                pc_grads[i].add_(task_grads[j], alpha=-coeff.item())
 
-    # 4. Average projected gradients
-    final_grad = torch.stack(pc_grads).mean(dim=0)
+    # 3. Sum across tasks, reusing pc_grads[0]'s buffer rather than stacking —
+    #    a stack would allocate another num_tasks x num_params vector, which is
+    #    ~120 MB of VRAM on this model for no benefit.
+    combined_grad = pc_grads[0]
+    for g in pc_grads[1:]:
+        combined_grad.add_(g)
+    combined_grad.mul_(accum_factor)
 
-    # 5. Assign back to parameters
-    optimizer.zero_grad()
+    # 4. Accumulate into p.grad.
     idx = 0
-    for p in params:
+    for p in trainable_params:
         num_elem = p.numel()
+        g_slice = combined_grad[idx : idx + num_elem].view_as(p)
         if p.grad is None:
-            p.grad = torch.zeros_like(p)
-        p.grad.data = final_grad[idx : idx + num_elem].view_as(p)
+            p.grad = g_slice.clone()
+        else:
+            p.grad.add_(g_slice)
         idx += num_elem
 
 
@@ -1093,6 +1170,8 @@ class Trainer:
 
         # ── Device ────────────────────────────────────────────────────
         self.device = self._resolve_device(tc)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
 
         # ── Run ID & directories ──────────────────────────────────────
         ckpt_root   = cfg.paths.checkpoint_dir
@@ -1122,6 +1201,11 @@ class Trainer:
         # ── Loss functions ────────────────────────────────────────────
         self.criterion_df = nn.BCEWithLogitsLoss()
         self.criterion_sp = FocalLoss(gamma=tc.focal_gamma, alpha=tc.focal_alpha)
+        # Supervises TemporalHead.clf, the branch validate() scores. The cosine
+        # term alone leaves it untrained (verified: 4 tensors with grad=None).
+        self.temporal_logit_weight = getattr(
+            cfg.model, "temporal_logit_loss_weight", 1.0
+        )
 
         # ── Optimizer (differential LR for backbone vs heads) ─────────
         base_model   = self.model.module if self.use_multi_gpu else self.model
@@ -1138,6 +1222,19 @@ class Trainer:
             ],
             weight_decay=tc.weight_decay,
         )
+        # Exactly the parameters the optimizer steps. Gradient clipping and
+        # PCGrad must use this list, not model.parameters(): log_weights is a
+        # mirror of GradNorm's own weights and is deliberately absent from the
+        # optimizer, so scaler.unscale_() never divides its gradient by the AMP
+        # scale. Clipping over model.parameters() therefore measured a norm
+        # inflated by the scale factor (~44649 instead of ~0.67) and scaled every
+        # real gradient down by ~1e-4, throttling training to a standstill.
+        self.optim_params = [
+            p for group in self.optimizer.param_groups for p in group["params"]
+        ]
+        # GradNormManager owns the task weights; this copy is written with
+        # copy_() under no_grad and must never accumulate a gradient itself.
+        base_model.log_weights.requires_grad_(False)
 
         # ── AMP ───────────────────────────────────────────────────────
         self.use_amp = (self.device.type == "cuda") and (tc.amp_dtype in ("float16", "bfloat16"))
@@ -1358,6 +1455,12 @@ class Trainer:
             "metrics":      metrics,
             "history":      self.history,
         }
+        # model.state_dict() carries MTLModel.log_weights, but that is only a
+        # mirror written by copy_(). The manager owns the live weights, its Adam
+        # momentum and the L(0) baseline — without them a resumed run restarts
+        # task balancing and immediately overwrites the restored mirror.
+        if self.gradnorm_manager is not None:
+            state["gradnorm"] = self.gradnorm_manager.state_dict()
 
         # Per-epoch snapshot (optional, controlled by cfg)
         if self.cfg.train.save_every_epoch:
@@ -1378,7 +1481,12 @@ class Trainer:
             return
 
         self.logger.info(f"Resuming from: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=self.device)
+        # weights_only defaults to True from torch 2.6 on, and these checkpoints
+        # carry numpy scalars inside "metrics"/"history", so the default raises
+        # UnpicklingError and resume=True could never load anything. The file is
+        # written by _save_checkpoint in this same run directory — our own data,
+        # not an untrusted download.
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
         self.model.load_state_dict(ckpt["model"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
@@ -1390,6 +1498,23 @@ class Trainer:
             self.logger.warning("Could not restore scheduler state.")
 
         self.scaler.load_state_dict(ckpt["scaler"])
+        # Restore task balancing. Checkpoints written before gradnorm state was
+        # persisted simply have no "gradnorm" key — keep the fresh manager then.
+        if self.gradnorm_manager is not None and "gradnorm" in ckpt:
+            self.gradnorm_manager.load_state_dict(ckpt["gradnorm"])
+            base_model = self.model.module if self.use_multi_gpu else self.model
+            with torch.no_grad():
+                base_model.log_weights.copy_(
+                    self.gradnorm_manager.log_weights.detach()
+                )
+            w = self.gradnorm_manager.weights.detach().cpu().numpy().round(4)
+            self.logger.info(f"Restored GradNorm task weights: {w}")
+        elif self.gradnorm_manager is not None:
+            self.logger.warning(
+                "Checkpoint has no GradNorm state — task weights and the L(0) "
+                "baseline restart from their initial values."
+            )
+
         self.start_epoch = ckpt["epoch"] + 1
         self.best_metric = ckpt.get("best_metric", -float("inf"))
         self.best_epoch  = ckpt.get("best_epoch", 0)
@@ -1464,9 +1589,9 @@ class Trainer:
 
         for batch in tqdm(loader, desc="Validate", leave=False):
             frames  = batch["frames"].to(self.device, non_blocking=True)
-            df_lbl  = batch["deepfake_label"].to(self.device).float()
-            sp_lbl  = batch["spoof_label"].to(self.device).float()
-            tmp_lbl = batch["temporal_label"].to(self.device).float()
+            df_lbl  = batch["deepfake_label"].to(self.device, non_blocking=True).float()
+            sp_lbl  = batch["spoof_label"].to(self.device, non_blocking=True).float()
+            tmp_lbl = batch["temporal_label"].to(self.device, non_blocking=True).float()
             videos  = batch.get("video_id", [""] * frames.size(0))
             datasets= batch.get("dataset",  [""] * frames.size(0))
 
@@ -1479,7 +1604,11 @@ class Trainer:
 
                 l_df   = self.criterion_df(df_logit, df_lbl)
                 l_sp   = self.criterion_sp(sp_logit, sp_lbl)
-                l_temp = temporal_consistency_loss(out["temp_proj"], tmp_logit)
+                l_temp = temporal_consistency_loss(
+                    out["temp_proj"], tmp_lbl,
+                    logit=tmp_logit,
+                    logit_weight=self.temporal_logit_weight,
+                )
 
             running_loss["df"]   += l_df.item()
             running_loss["sp"]   += l_sp.item()
@@ -1580,9 +1709,15 @@ class Trainer:
         self.result_logger.log(row)
 
         # ── Console summary ───────────────────────────────────────────
-        df_auc  = val_metrics.get("df_auc",  float("nan"))
-        sp_acer = val_metrics.get("sp_acer", float("nan"))
-        tmp_acc = val_metrics.get("tmp_acc", float("nan"))
+        # fit() double-prefixes: validate() emits "df_auc_roc"/"sp_acer"/
+        # "tmp_bin_acc", then the per-loader merge prepends "ff_"/"siw_". The
+        # old "df_auc"/"tmp_acc" lookups matched neither layer and printed nan
+        # on every epoch line of every run. Deepfake AUC comes from the FF++
+        # loader and ACER from the SiW-Mv2 loader — the other pairing is
+        # meaningless (there are no attacks in FF++, no fakes in SiW-Mv2).
+        df_auc  = val_metrics.get("ff_df_auc_roc",  float("nan"))
+        sp_acer = val_metrics.get("siw_sp_acer",    float("nan"))
+        tmp_acc = val_metrics.get("ff_tmp_bin_acc", float("nan"))
 
         self.logger.info(
             f"[{epoch:03d}/{tc.num_epochs}]  "
@@ -1621,9 +1756,37 @@ class Trainer:
                 {f"siw_{k}": v for k, v in siw_metrics.items()}
             )
 
+            # ── Composite metric ──────────────────────────────────────
+            # Keys must match validate()'s prefixed output:
+            # compute_deepfake_metrics returns "auc_roc" -> "df_auc_roc".
+            # Reading "df_auc" hit the 0.0 default on every single epoch, so
+            # composite collapsed to 0.5 * (1 - sp_acer): best.pth and early
+            # stopping were driven by anti-spoofing alone and the deepfake
+            # task had no influence on model selection at all.
+            df_auc  = ff_metrics.get("df_auc_roc")
+            sp_acer = siw_metrics.get("sp_acer")
+            if df_auc is None or sp_acer is None or not np.isfinite(sp_acer):
+                self.logger.warning(
+                    f"composite: df_auc_roc={df_auc} sp_acer={sp_acer} — "
+                    f"metrics guarded on a single-class split return nothing; "
+                    f"the missing term falls back to its worst value"
+                )
+            composite = (
+                (df_auc if df_auc is not None else 0.0) * 0.5 +
+                (1.0 - (sp_acer if sp_acer is not None
+                        and np.isfinite(sp_acer) else 1.0)) * 0.5
+            )
+
             # ── Scheduler step ────────────────────────────────────────
+            # Feed the plateau scheduler the same composite that drives
+            # best-model tracking and early stopping, so LR reduction cannot
+            # disagree with model selection. It previously received
+            # ff_metrics["df_auc"] — a key that does not exist — so it saw a
+            # constant 0.0, never registered an improvement under mode="max",
+            # and walked the LR down to min_lr on a fixed schedule regardless
+            # of how the model was actually doing.
             if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.scheduler.step(ff_metrics.get("df_auc", 0.0))
+                self.scheduler.step(composite)
             else:
                 self.scheduler.step()
 
@@ -1632,10 +1795,6 @@ class Trainer:
             power_w    = float(np.mean(self.power_monitor.readings)) if self.power_monitor.readings else 0.0
 
             # ── Best-model tracking ───────────────────────────────────
-            composite = (
-                ff_metrics.get("df_auc",  0.0) * 0.5 +
-                (1.0 - siw_metrics.get("sp_acer", 1.0)) * 0.5
-            )
             is_best = composite > self.best_metric
             if is_best:
                 self.best_metric = composite
@@ -1687,42 +1846,47 @@ class Trainer:
         pbar = tqdm(loader, desc=f"Train {epoch:03d}", leave=False)
         for step, batch in enumerate(pbar):
             frames  = batch["frames"].to(self.device, non_blocking=True)
-            df_lbl  = batch["deepfake_label"].to(self.device).float()
-            sp_lbl  = batch["spoof_label"].to(self.device).float()
-            tmp_lbl = batch["temporal_label"].to(self.device).float()
-    
+            df_lbl  = batch["deepfake_label"].to(self.device, non_blocking=True).float()
+            sp_lbl  = batch["spoof_label"].to(self.device, non_blocking=True).float()
+            tmp_lbl = batch["temporal_label"].to(self.device, non_blocking=True).float()
+
             with self.autocast_ctx:
                 out    = self.model(frames)
-    
+
                 l_df   = self.criterion_df(out["deepfake_logit"], df_lbl)
                 l_sp   = self.criterion_sp(out["spoof_logit"],   sp_lbl)
-                l_temp = temporal_consistency_loss(out["temp_proj"], tmp_lbl)
-    
+                l_temp = temporal_consistency_loss(
+                    out["temp_proj"], tmp_lbl,
+                    logit=out["temp_logit"],
+                    logit_weight=self.temporal_logit_weight,
+                )
+
                 # Task weights
                 w    = base_model.task_weights                # (3,) normalized
                 loss = (w[0] * l_df + w[1] * l_sp + w[2] * l_temp) / tc.grad_accum_steps
     
             # ── Backward ──────────────────────────────
+            run_gradnorm_now = self.use_gradnorm and (step % tc.gradnorm_interval == 0)
+
             if self.use_pcgrad:
-                pcgrad_step(
-                    [w[0] * l_df / tc.grad_accum_steps,
-                     w[1] * l_sp / tc.grad_accum_steps,
-                     w[2] * l_temp / tc.grad_accum_steps],
-                    self.optimizer,
-                    retain_graph=self.use_gradnorm,
+                compute_pcgrad_grads(
+                    [w[0] * l_df, w[1] * l_sp, w[2] * l_temp],
+                    self.optim_params,
+                    scaler=self.scaler if self.use_amp else None,
+                    accum_factor=1.0 / tc.grad_accum_steps,
+                    retain_graph_last=run_gradnorm_now,
                 )
             else:
                 self.scaler.scale(loss).backward(
-                    retain_graph=self.use_gradnorm
+                    retain_graph=run_gradnorm_now
                 )
-    
-            if self.use_gradnorm:
-                losses_tensor = torch.stack([l_df, l_sp, l_temp])  # fix: list→Tensor
+
+            if run_gradnorm_now:
+                losses_tensor = torch.stack([l_df, l_sp, l_temp])
                 new_w = self.gradnorm_manager.update(
                     losses_tensor,
                     list(base_model.backbone.parameters()),
                 )
-
                 with torch.no_grad():
                     base_model.log_weights.copy_(
                         torch.log(new_w.clamp(min=1e-8))
@@ -1730,15 +1894,18 @@ class Trainer:
 
             is_accum_step = (step + 1) % tc.grad_accum_steps == 0
             is_last_step  = (step + 1) == len(loader)
-    
+
             if is_accum_step or is_last_step:
-                if not self.use_pcgrad:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), tc.max_grad_norm  # fix: grad_clip→max_grad_norm
-                    )
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                # Both branches leave p.grad scaled by the AMP scale, so the
+                # unscale → clip → step → update sequence is shared. Going
+                # through the scaler is what makes an overflowed step get
+                # skipped instead of writing inf/nan into the weights.
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.optim_params, tc.max_grad_norm
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
                 self.optimizer.zero_grad(set_to_none=True)
     
@@ -1774,8 +1941,7 @@ def load_csv(path: str) -> pd.DataFrame:
     return df
 
 
-def build_loaders(cfg: Config) -> Tuple[DataLoader, DataLoader, DataLoader,
-                                         DataLoader, DataLoader]:
+def build_loaders(cfg: Config) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Build all train/val loaders."""
     pc = cfg.paths
 

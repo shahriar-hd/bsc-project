@@ -213,17 +213,17 @@ class PreprocessConfig:
 
 @dataclass
 class PathConfig:
-    data_root: str = ( # TODO: Change path
+    data_root: str = (
         "/home/shahriar/Documents/bsc-project/data/datasets/processed/"
     )
     csv_root: str = data_root + "csv/"
     master_csv: str = csv_root + "master.csv"
-    siwmv2_train_csv: str = csv_root + "SiW-Mv2_train.csv"
-    siwmv2_val_csv: str = csv_root + "SiW-Mv2_val.csv"
-    siwmv2_test_csv: str = csv_root + "SiW-Mv2_test.csv"
-    ff_train_csv: str = csv_root + "FaceForensics++_train.csv"
-    ff_val_csv: str = csv_root + "FaceForensics++_val.csv"
-    ff_test_csv: str = csv_root + "FaceForensics++_test.csv"
+    siwmv2_train_csv: str = csv_root + "siw_train.csv"
+    siwmv2_val_csv: str = csv_root + "siw_val.csv"
+    siwmv2_test_csv: str = csv_root + "siw_test.csv"
+    ff_train_csv: str = csv_root + "ff_train.csv"
+    ff_val_csv: str = csv_root + "ff_val.csv"
+    ff_test_csv: str = csv_root + "ff_test.csv"
 
     output_root: str = "./runs"
     checkpoint_dir: str = "./checkpoints"
@@ -254,6 +254,18 @@ class ModelConfig:
     # TSM (Temporal Shift Module)
     use_tsm: bool = True
     tsm_shift_ratio: float = 0.125
+    # TSM is applied to the feature maps entering these backbone blocks. On
+    # EfficientNet-B2 they carry 16 / 48 / 120 channels, all divisible by the
+    # 1/8 shift ratio. Never shift the raw 3-channel input — that swaps colour
+    # planes between frames instead of mixing temporal context.
+    tsm_block_indices: tuple = (1, 3, 5)
+
+    # Recompute backbone block activations in the backward pass instead of
+    # storing them. Measured on the 4 GB RTX 3050 Ti at batch_size=4,
+    # num_frames=8 with PCGrad + GradNorm: 2426 MiB → OOM without it,
+    # 1133 MiB peak with it. Costs ~30% step time because PCGrad backwards the
+    # graph once per task and each backward re-runs the blocks.
+    grad_checkpointing: bool = True
 
     # ── Temporal head redesign ───────────────────────────────────────────────
     temporal_supervision: str = "combined"
@@ -264,6 +276,11 @@ class ModelConfig:
     temporal_pseudo_threshold: float = 0.5   # min confidence to use a pseudo-label
     temporal_proj_dim: int = 128             # projection dim inside temporal head
     optical_flow_in_channels: int = 2        # must match TrainConfig.optical_flow_channels
+    # Weight of the BCE term on the temporal head's classifier logit. The
+    # cosine-similarity term only trains `proj`; `clf` — whose output is what
+    # validate() reports temporal accuracy/AUC on — receives no gradient
+    # without this. Set to 0.0 to reproduce the projection-only ablation.
+    temporal_logit_loss_weight: float = 1.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -274,15 +291,21 @@ class ModelConfig:
 class TrainConfig:
     seed: int = 42
     num_epochs: int = 25
-    batch_size: int = 16                     # per GPU TODO: change batch size
-    num_workers: int = 4
+    batch_size: int = 4                      # per GPU (optimized for 4GB VRAM)
+    num_workers: int = 2                     # 2 workers to keep RAM footprint low
     pin_memory: bool = True
-    grad_accum_steps: int = 2                  # effective batch = batch_size * accum
-    gradnorm_interval = 10
-    resume: bool = True                        # TODO: True 
+    grad_accum_steps: int = 4                # effective batch = batch_size * accum = 16
+    gradnorm_interval: int = 10              # run GradNorm update every 10 steps
+    resume: bool = True
+    # _save_checkpoint() reads this every epoch; without it the first
+    # checkpoint save raised AttributeError and killed the run *after* a full
+    # epoch of training had already completed. False keeps only last.pth and
+    # best.pth — a per-epoch snapshot of this model is ~107 MB, so 25 epochs
+    # of them would write ~2.7 GB.
+    save_every_epoch: bool = False
 
     # Temporal sampling
-    num_frames: int = 16                       # T frames per clip
+    num_frames: int = 8                      # 8 frames per clip (optimal memory & temporal representation)
     temporal_jitter: bool = True
     min_frame_gap: int = 1
     max_frame_gap: int = 4
@@ -319,7 +342,7 @@ class TrainConfig:
     # OOM handling
     oom_fallback_cpu: bool = True
     reduce_batch_on_oom: bool = True
-    min_batch_size: int = 4
+    min_batch_size: int = 2
 
     # Gradient clipping
     max_grad_norm: float = 5.0
@@ -329,12 +352,12 @@ class TrainConfig:
 
     # ── Device & precision ──────────────────────────────────────────────────
     device: str = "cuda"               # "cuda", "cpu", or "cuda:0,1,..."
-    amp_dtype: str = "bfloat16"         # "float16" | "bfloat16" | "float32" (float32 = AMP disabled)
+    amp_dtype: str = "float16"         # "float16" | "bfloat16" | "float32" (float32 = AMP disabled)
     fallback_to_cpu: bool = True       # if CUDA unavailable, fall back to CPU silently
-    # TODO:
+
     # ── Multi-GPU ────────────────────────────────────────────────────────────
-    use_ddp: bool = True               # DistributedDataParallel (multi-node)
-    use_data_parallel: bool = True     # DataParallel (single-node multi-GPU, simpler)
+    use_ddp: bool = False              # DistributedDataParallel (multi-node)
+    use_data_parallel: bool = False    # DataParallel (single-node multi-GPU)
     gpu_ids: list = field(default_factory=lambda: [])  # e.g. [0,1]; empty = all visible
 
     # ── Early stopping ───────────────────────────────────────────────────────
