@@ -29,9 +29,6 @@ class PreprocessConfig:
     processed_root: Path = Path(
         "/home/shahriar/Documents/bsc-project/data/datasets/processed"
     )
-    master_csv_path: Path = Path(
-        "/home/shahriar/Documents/bsc-project/data/datasets/processed/csv/master.csv"
-    )
 
     # ── Dataset names (must match folder names under raw_data_root) ───────────
     ff_dataset_name: str = "FaceForensics++"
@@ -82,24 +79,9 @@ class PreprocessConfig:
     output_face_size: int = 224           # final square crop (px)
     crop_scale: float = 1.1               # padding around aligned face
 
-    # ── Bounding-box smoothing ────────────────────────────────────────────────
-    # Exponential moving average alpha for bbox smoothing.
-    # Lower = more smoothing, higher = faster response to real motion.
-    bbox_ema_alpha: float = 0.35
-
-    # Max allowed per-frame displacement relative to face size before a
-    # detection is treated as jitter (not real motion).
-    # Expressed as fraction of the face's shorter side.
-    bbox_jitter_threshold: float = 0.40
-
-    # Number of consecutive "jitter" frames allowed before we accept the
-    # new position as genuine subject motion.
-    bbox_jitter_tolerance: int = 3
-
-    # ── Train / Val / Test split ratios (must sum to 1.0) ─────────────────────
+    # ── Train / Val split ratios (test gets the remainder) ────────────────────
     train_ratio: float = 0.70
     val_ratio: float = 0.15
-    test_ratio: float = 0.15
 
     # Random seed for reproducible splits
     split_seed: int = 42
@@ -176,6 +158,22 @@ class PreprocessConfig:
     # Effective margin = min(margin, (total_frames - clip_span) // 4).
     adaptive_margin: bool = True
 
+    # ── Optical flow precompute ───────────────────────────────────────────────
+    # Flow is computed here, once, and written next to each clip's crops as
+    # c<clip>_flow.npz. train.py only ever *reads* it — Farneback over a
+    # 64-frame clip costs ~0.4 s, which 2 dataloader workers cannot absorb at
+    # training speed, so computing it in __getitem__ would starve the GPU.
+    # Consumed only when TrainConfig.use_optical_flow is True.
+    precompute_optical_flow: bool = True
+    optical_flow_method: str = "farneback"   # only "farneback" is implemented
+
+    # Stored flow resolution. The encoder is Conv2d(2→32, 3×3) followed by
+    # AdaptiveAvgPool2d((4, 4)), so spatial detail beyond ~56 px is pooled away
+    # before it reaches a linear layer. Disk is the real constraint: 2848 clips
+    # × 63 pairs is 16.8 GB at 112 in float32, against 29 GB free. At 56 with
+    # int8 + a per-clip scale it measures ~126 KB/clip → ~350 MB total.
+    flow_resize: int = 56
+
     # ── Parallelism ───────────────────────────────────────────────────────────
     # Worker processes for video extraction. Each worker runs its own
     # InsightFace/ONNX session, so both GPU memory and RAM scale with it.
@@ -239,8 +237,6 @@ class PathConfig:
 class ModelConfig:
     backbone: str = "efficientnet_b2"          # or "vit_small_patch16_224"
     pretrained: bool = True
-    pretrained_source: str = "imagenet"        # "imagenet" | "vggface2" | path
-    freeze_backbone_epochs: int = 2            # phase-1: heads only
     backbone_lr_scale: float = 0.1             # lr_backbone = scale * lr_heads
     feature_dim: int = 1408                    # EfficientNet-B2 output dim
     dropout: float = 0.3
@@ -249,7 +245,6 @@ class ModelConfig:
     deepfake_hidden: int = 256
     spoof_hidden: int = 256
     temporal_hidden: int = 256
-    num_spoof_classes: int = 2                 # binary spoof (real/attack)
 
     # TSM (Temporal Shift Module)
     use_tsm: bool = True
@@ -267,15 +262,17 @@ class ModelConfig:
     # graph once per task and each backward re-runs the blocks.
     grad_checkpointing: bool = True
 
-    # ── Temporal head redesign ───────────────────────────────────────────────
+    # ── Temporal head ────────────────────────────────────────────────────────
+    # Which branches TemporalHead builds and supervises:
+    #   "cosine_sim"   → projection + classifier only; no flow encoder built
+    #   "optical_flow" → adds the flow encoder
+    #   "combined"     → same as optical_flow here, since the pseudo-label
+    #                    branch is deliberately not wired (temporal_label is
+    #                    real ground truth, so a deepfake-derived pseudo-label
+    #                    would be circular self-distillation)
     temporal_supervision: str = "combined"
-    # "cosine_sim"   → original (kept for ablation)
-    # "pseudo_label" → mean of adjacent deepfake predictions (recommended)
-    # "optical_flow" → uses precomputed optical flow signal
-    # "combined"     → pseudo_label + optical flow (best)
-    temporal_pseudo_threshold: float = 0.5   # min confidence to use a pseudo-label
     temporal_proj_dim: int = 128             # projection dim inside temporal head
-    optical_flow_in_channels: int = 2        # must match TrainConfig.optical_flow_channels
+    optical_flow_in_channels: int = 2        # dx, dy — see utils.flow_utils.FLOW_CHANNELS
     # Weight of the BCE term on the temporal head's classifier logit. The
     # cosine-similarity term only trains `proj`; `clf` — whose output is what
     # validate() reports temporal accuracy/AUC on — receives no gradient
@@ -339,11 +336,6 @@ class TrainConfig:
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
 
-    # OOM handling
-    oom_fallback_cpu: bool = True
-    reduce_batch_on_oom: bool = True
-    min_batch_size: int = 2
-
     # Gradient clipping
     max_grad_norm: float = 5.0
 
@@ -356,7 +348,6 @@ class TrainConfig:
     fallback_to_cpu: bool = True       # if CUDA unavailable, fall back to CPU silently
 
     # ── Multi-GPU ────────────────────────────────────────────────────────────
-    use_ddp: bool = False              # DistributedDataParallel (multi-node)
     use_data_parallel: bool = False    # DataParallel (single-node multi-GPU)
     gpu_ids: list = field(default_factory=lambda: [])  # e.g. [0,1]; empty = all visible
 
@@ -370,22 +361,22 @@ class TrainConfig:
     # ── Warmup ─────────────────────────────
     warmup_epochs: int = 3             # linear warmup before cosine schedule
 
-    # ── Optical flow for temporal branch ────────────────────────────────────
-    use_optical_flow: bool = True
-    optical_flow_method: str = "farneback"  # "farneback" | "raft" (raft needs extra install)
-    optical_flow_channels: int = 2          # dx, dy → 2 channels appended to RGB
-    optical_flow_cache: bool = True         # cache precomputed flows to disk
+    # ── Optical flow (read from disk; never computed here) ───────────────────
+    # Off by default: turning it on only makes the dataloader *load* the .npz
+    # files PreprocessConfig.precompute_optical_flow wrote, so nothing about the
+    # training step computes flow either way. With it off, TemporalHead.flow_encoder
+    # receives no gradient — which is the current, verified baseline.
+    #
+    # Requires: preprocessing run with precompute_optical_flow = True, and
+    # ModelConfig.temporal_supervision in ("optical_flow", "combined") so the
+    # encoder is actually built. Missing files downgrade to a warning, not a crash.
+    use_optical_flow: bool = False
+    # Weight of the BCE term on the flow encoder's consistency score. This is
+    # what gives flow_encoder a gradient: judge real vs. fake from motion alone.
+    flow_loss_weight: float = 0.2
 
     # PCGrad
     use_pcgrad: bool = True
-
-    # Temporal supervision
-    flow_resize: int = 112
-    pseudo_label_weight: float = 0.3
-    flow_loss_weight: float = 0.2
-    temporal_supervision: str = "combined"  # "pseudo_label" | "optical_flow" | "combined"
-
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Augmentation
@@ -418,7 +409,6 @@ class AugConfig:
 
 @dataclass
 class EvalConfig:
-    eval_every: int = 1                        # evaluate every N epochs
     fpr_threshold: float = 0.01               # TPR @ FPR=1%
     # Video-level aggregation
     video_agg: str = "mean"                   # "mean" | "max"
@@ -464,7 +454,6 @@ class LogConfig:
     file_level: str = "DEBUG"          # level for file handler
     fmt: str = "%(asctime)s | %(levelname)-7s | %(message)s"
     datefmt: str = "%Y-%m-%d %H:%M:%S"
-    banner_width: int = 60
 
 
 # ══════════════════════════════════════════════════════════════════════════════

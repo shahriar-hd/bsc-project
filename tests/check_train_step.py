@@ -45,14 +45,21 @@ def grad_coverage(trainer, model, batch, dev):
     df_l = batch["deepfake_label"].to(dev).float()
     sp_l = batch["spoof_label"].to(dev).float()
     tp_l = batch["temporal_label"].to(dev).float()
+    # Mirrors _train_epoch: present only when use_optical_flow is on AND
+    # preprocessing wrote the .npz files.
+    flow = batch.get("flow")
+    if flow is not None:
+        flow = flow.to(dev)
     with trainer.autocast_ctx:
-        out = model(frames)
+        out = model(frames, flow=flow)
         loss = (trainer.criterion_df(out["deepfake_logit"], df_l)
                 + trainer.criterion_sp(out["spoof_logit"], sp_l)
                 + T.temporal_consistency_loss(
                     out["temp_proj"], tp_l,
                     logit=out["temp_logit"],
-                    logit_weight=trainer.temporal_logit_weight))
+                    logit_weight=trainer.temporal_logit_weight,
+                    flow_score=out.get("flow_consistency"),
+                    flow_weight=trainer.flow_loss_weight))
     trainer.scaler.scale(loss).backward()
     ids = {id(p) for p in trainer.optim_params}
     dead = [n for n, p in model.named_parameters()
@@ -242,9 +249,21 @@ def main():
     flow_dead = [n for n in dead if "flow_encoder" in n]
     other_dead = [n for n in dead if "flow_encoder" not in n]
     assert not other_dead, f"parameters receive no gradient: {other_dead}"
-    if flow_dead:
-        print(f"       ({len(flow_dead)} are flow_encoder — unreachable until "
-              f"optical flow is fed to TemporalHead)")
+    # flow_encoder is reached only by the flow BCE term, which is only active
+    # when precomputed flow was actually loaded. Assert both directions so
+    # neither the baseline nor the flow-enabled run can silently regress.
+    flow_live = trainer.flow_loss_weight > 0.0 and any(
+        getattr(d, "use_flow", False)
+        for d in getattr(loader.dataset, "datasets", [loader.dataset])
+    )
+    if flow_live:
+        assert not flow_dead, (
+            f"optical flow is loaded but flow_encoder gets no gradient: {flow_dead}"
+        )
+        print("[grad] flow_encoder is receiving gradient (flow enabled)")
+    elif flow_dead:
+        print(f"       ({len(flow_dead)} are flow_encoder — no flow loaded, so "
+              f"unreachable. Expected with use_optical_flow=False)")
     if static:
         # Exclude the ones already reported as receiving no gradient — calling
         # those "alive" would contradict the line above.

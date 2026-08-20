@@ -42,6 +42,8 @@ docs/proposal/
 instance*
 *.zip
 *.rar
+commit*
+.txt
 
 # Logs
 logs/

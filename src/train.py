@@ -18,7 +18,7 @@ import threading
 from copy import deepcopy
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -43,11 +43,21 @@ from scipy.interpolate import interp1d
 from tqdm import tqdm
 
 from src.config import Config, get_config
+from src.utils.flow_utils import (
+    accumulate_flow,
+    flow_path_for_clip,
+    load_clip_flow,
+    zero_flow,
+)
 from src.utils.logger_utils import log_banner, setup_logger
 from src.utils.power_utils import GPUSample, PowerMonitor, power_monitor_from_config
 from src.utils.repro_utils import set_seed, worker_init_fn
 
 warnings.filterwarnings("ignore")
+
+# Same name setup_logger() configures, so Dataset code (which has no Trainer to
+# borrow self.logger from) writes into the run's training.log too.
+logger = logging.getLogger("MTL")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -131,10 +141,44 @@ class MTLDataset(Dataset):
         # Group frames by clip
         self.clips = self._build_clips(df)
 
+        # Optical flow is *read* here, never computed — see utils/flow_utils.py
+        # for why (Farneback is ~0.4 s/clip; two workers cannot hide that).
+        self.use_flow = bool(cfg.train.use_optical_flow)
+        self.flow_resize = 0
+        self._flow_missing = 0
+        if self.use_flow:
+            self.use_flow, self.flow_resize = self._probe_flow()
+
+    def _probe_flow(self) -> Tuple[bool, int]:
+        """Confirm precomputed flow is readable and learn its resolution.
+
+        The resolution is taken from the file rather than from
+        PreprocessConfig.flow_resize so a stale set of files is never silently
+        reinterpreted at the wrong scale, and so changing the config does not
+        require the reader to be updated in lockstep.
+        """
+        if not self.clips:
+            return False, 0
+        probe = flow_path_for_clip(
+            self.clips[0]["frame_paths"][0], self.clips[0]["clip_index"]
+        )
+        if probe.exists():
+            try:
+                return True, int(load_clip_flow(probe).shape[-1])
+            except Exception as exc:                   # noqa: BLE001
+                logger.warning("Flow file unreadable (%s): %s: %s",
+                               probe, type(exc).__name__, exc)
+        else:
+            logger.warning(
+                "use_optical_flow=True but %s is missing — training continues "
+                "WITHOUT flow (flow_encoder stays untrained). Re-run "
+                "preprocessing with precompute_optical_flow=True.", probe,
+            )
+        return False, 0
+
     def _build_clips(self, df: pd.DataFrame) -> List[dict]:
         """Group rows by (video_index, clip_index) and build clip records."""
         clips = []
-        group_cols = ["video_index", "clip_index", "video_path"]
         for _, grp in df.groupby(["video_path", "clip_index"], sort=False):
             grp = grp.sort_values("frame_num")
             task = grp["task"].iloc[0]
@@ -152,29 +196,50 @@ class MTLDataset(Dataset):
                 "spoof_type": spoof_type,
                 "dataset": dataset,
                 "video_path": video_path,
+                # Needed to locate this clip's precomputed flow file.
+                "clip_index": int(grp["clip_index"].iloc[0]),
             })
         return clips
 
-    def _sample_frames(self, paths: List[str]) -> List[str]:
-        """Sample T frames with optional random jitter."""
+    def _sample_frames(self, n_available: int) -> List[int]:
+        """Positions of the T frames to load, as indices into the clip.
+
+        Returns indices rather than paths because the precomputed flow is
+        indexed by position: stored pair k is the flow from saved frame k to
+        k+1, so accumulating it across a jitter gap of 2-4 requires knowing
+        which positions were picked.
+        """
         tc = self.cfg.train
-        N = len(paths)
+        N = n_available
         if N <= self.T:
-            # Repeat to fill
-            chosen = (paths * ((self.T // N) + 1))[:self.T]
-        else:
-            if self.is_train and tc.temporal_jitter:
-                gap = random.randint(tc.min_frame_gap, tc.max_frame_gap)
-                max_start = N - gap * (self.T - 1) - 1
-                if max_start < 0:
-                    indices = np.linspace(0, N - 1, self.T, dtype=int)
-                else:
-                    start = random.randint(0, max_start)
-                    indices = [min(start + i * gap, N - 1) for i in range(self.T)]
-            else:
-                indices = np.linspace(0, N - 1, self.T, dtype=int)
-            chosen = [paths[i] for i in indices]
-        return chosen
+            # Repeat to fill. Wraps back to 0, so the flow accumulator sees a
+            # non-increasing step there and emits zeros for that pair.
+            return (list(range(N)) * ((self.T // max(N, 1)) + 1))[:self.T]
+
+        if self.is_train and tc.temporal_jitter:
+            gap = random.randint(tc.min_frame_gap, tc.max_frame_gap)
+            max_start = N - gap * (self.T - 1) - 1
+            if max_start < 0:
+                return [int(i) for i in np.linspace(0, N - 1, self.T, dtype=int)]
+            start = random.randint(0, max_start)
+            return [min(start + i * gap, N - 1) for i in range(self.T)]
+
+        return [int(i) for i in np.linspace(0, N - 1, self.T, dtype=int)]
+
+    def _load_flow(self, clip: dict, indices: List[int]) -> torch.Tensor:
+        """Precomputed flow for the T frames this sample chose → (T-1, 2, R, R)."""
+        path = flow_path_for_clip(clip["frame_paths"][0], clip["clip_index"])
+        try:
+            pair_flow = load_clip_flow(path)
+        except Exception:                              # noqa: BLE001
+            # Per-clip fallback: zeros keep the batch collatable. Warn once per
+            # worker rather than once per sample.
+            self._flow_missing += 1
+            if self._flow_missing == 1:
+                logger.warning("Flow missing/unreadable for %s — using zeros "
+                               "for this clip (further cases silent)", path)
+            return torch.from_numpy(zero_flow(self.T - 1, self.flow_resize))
+        return torch.from_numpy(accumulate_flow(pair_flow, indices))
 
     def _load_frame(self, path: str) -> np.ndarray:
         """Load and augment a single frame."""
@@ -186,7 +251,8 @@ class MTLDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         clip = self.clips[idx]
-        frame_paths = self._sample_frames(clip["frame_paths"])
+        indices = self._sample_frames(len(clip["frame_paths"]))
+        frame_paths = [clip["frame_paths"][i] for i in indices]
 
         # One augmentation drawn per *clip*, not per frame. Albumentations'
         # `images` target applies identical parameters to every frame in the
@@ -213,15 +279,21 @@ class MTLDataset(Dataset):
 
         temporal_label = binary_label  # temporal
 
-        return {
+        sample = {
             "frames": frames_tensor,
             "deepfake_label": torch.tensor(deepfake_label, dtype=torch.long),
             "spoof_label": torch.tensor(spoof_label, dtype=torch.long),
             "temporal_label": torch.tensor(temporal_label, dtype=torch.long),
             "task": task,
             "dataset": clip["dataset"],
-            "video_id": clip["video_path"],  # video_path 
+            "video_id": clip["video_path"],  # video_path
         }
+        # The key is present for every sample or for none — a mixed batch would
+        # not collate. `use_flow` is decided once in __init__, so it cannot vary
+        # between samples of the same dataset.
+        if self.use_flow:
+            sample["flow"] = self._load_flow(clip, indices)
+        return sample
 
 
 
@@ -237,6 +309,27 @@ def build_interleaved_loader(
     """
     ff_ds = MTLDataset(ff_df, cfg, is_train)
     siw_ds = MTLDataset(siwmv2_df, cfg, is_train)
+
+    # A batch mixes both datasets, and default_collate cannot stack samples where
+    # only some carry a "flow" key. Each dataset probes its own files, so they can
+    # legitimately disagree (e.g. preprocessing re-run for FF++ only) — settle it
+    # here, once, rather than crashing in the first collate.
+    if ff_ds.use_flow != siw_ds.use_flow:
+        logger.warning(
+            "Precomputed flow found for only one dataset (ff=%s, siw=%s) — "
+            "disabling flow for both so batches stay collatable. Re-run "
+            "preprocessing over both datasets to enable it.",
+            ff_ds.use_flow, siw_ds.use_flow,
+        )
+        ff_ds.use_flow = siw_ds.use_flow = False
+    elif ff_ds.use_flow and ff_ds.flow_resize != siw_ds.flow_resize:
+        # Same problem one level down: different R means different tensor shapes.
+        logger.warning(
+            "Flow resolution differs between datasets (ff=%d, siw=%d) — "
+            "disabling flow. Re-run preprocessing with one flow_resize.",
+            ff_ds.flow_resize, siw_ds.flow_resize,
+        )
+        ff_ds.use_flow = siw_ds.use_flow = False
 
     from torch.utils.data import ConcatDataset
     combined = ConcatDataset([ff_ds, siw_ds])
@@ -344,19 +437,25 @@ class AntiSpoofHead(nn.Module):
 
 class TemporalHead(nn.Module):
     """
-    Redesigned temporal consistency head with explicit supervision.
+    Temporal consistency head with two independently supervised branches.
 
-    Supports three modes:
-      - 'pseudo_label':  binary label from mean of adjacent deepfake predictions
-      - 'optical_flow':  consistency score from precomputed optical flow
-      - 'combined':      both pseudo-label + flow auxiliary loss (recommended)
+    `proj` is trained by the adjacent-frame cosine term and `clf` by BCE on the
+    temporal label — `validate()` scores `clf`, so both matter. `supervision`
+    only decides whether the third branch, `flow_encoder`, is built:
+
+      - 'cosine_sim':   proj + clf only; flow_encoder is None
+      - 'optical_flow': adds flow_encoder, fed the precomputed .npz flow
+      - 'combined':     same as optical_flow — the 'pseudo_label' branch below
+                        stays unused on purpose, since temporal_label is real
+                        ground truth and a deepfake-derived pseudo-label would
+                        be circular self-distillation
 
     Args:
         feature_dim:    backbone output dimension (e.g. 1408 for EfficientNet-B2)
         proj_dim:       temporal projection dimension
         hidden_dim:     classifier hidden dimension
         dropout:        dropout probability
-        supervision:    'pseudo_label' | 'optical_flow' | 'combined'
+        supervision:    'cosine_sim' | 'optical_flow' | 'combined'
         flow_channels:  optical flow channels (2 = dx, dy)
     """
 
@@ -493,8 +592,11 @@ class MTLModel(nn.Module):
         self.spoof_head = AntiSpoofHead(feat_dim, mc.spoof_hidden, mc.dropout)
         self.temporal_head = TemporalHead(
             feature_dim=feat_dim,
-            proj_dim=mc.temporal_hidden,
-            dropout=mc.dropout
+            proj_dim=mc.temporal_proj_dim,
+            hidden_dim=mc.temporal_hidden,
+            dropout=mc.dropout,
+            supervision=mc.temporal_supervision,
+            flow_channels=mc.optical_flow_in_channels,
         )
 
 
@@ -549,7 +651,8 @@ class MTLModel(nn.Module):
 
     def forward(
         self,
-        frames: torch.Tensor,          # (B, T, C, H, W)
+        frames: torch.Tensor,                    # (B, T, C, H, W)
+        flow: Optional[torch.Tensor] = None,     # (B, T-1, 2, R, R) or None
     ) -> dict:
         B, T, C, H, W = frames.shape
         x = frames.view(B * T, C, H, W)
@@ -561,7 +664,9 @@ class MTLModel(nn.Module):
 
         df_logit = self.deepfake_head(frame_feat)
         sp_logit = self.spoof_head(frame_feat)
-        temp_out   = self.temporal_head(feats)
+        # `flow` is read from disk by MTLDataset (precomputed in preprocessing);
+        # None keeps the flow_encoder out of the graph entirely.
+        temp_out   = self.temporal_head(feats, flow=flow)
         temp_proj  = temp_out["temp_proj"]
         temp_logit = temp_out["temp_logit"]
 
@@ -599,6 +704,8 @@ def temporal_consistency_loss(
     labels: torch.Tensor,  # (B,) binary
     logit: Optional[torch.Tensor] = None,   # (B,) temporal head classifier logit
     logit_weight: float = 1.0,
+    flow_score: Optional[torch.Tensor] = None,  # (B,) flow_encoder consistency
+    flow_weight: float = 0.0,
 ) -> torch.Tensor:
     """
     Self-supervised temporal loss:
@@ -609,6 +716,11 @@ def temporal_consistency_loss(
     a separate branch, so passing `logit` is what gives it a gradient — and
     validate() reports temporal accuracy/AUC on exactly that logit, so without
     the BCE term those metrics score a randomly-initialised head forever.
+
+    `flow_encoder` is a *third* branch with the same problem: it is reached by
+    neither term above. Its BCE — judge real vs. fake from motion alone — is the
+    only thing that trains it, which is why `use_optical_flow = False` leaves its
+    8 parameters dead rather than merely unhelpful.
     """
     # Adjacent frame cosine similarity: (B, T-1)
     p1 = proj[:, :-1]                         # (B, T-1, H)
@@ -625,6 +737,11 @@ def temporal_consistency_loss(
     if logit is not None and logit_weight > 0.0:
         loss = loss + logit_weight * F.binary_cross_entropy_with_logits(
             logit.flatten(), labels.float().flatten()
+        )
+
+    if flow_score is not None and flow_weight > 0.0:
+        loss = loss + flow_weight * F.binary_cross_entropy_with_logits(
+            flow_score.flatten(), labels.float().flatten()
         )
     return loss
 
@@ -661,6 +778,7 @@ def compute_deepfake_metrics(
     labels: np.ndarray,
     scores: np.ndarray,
     video_paths: Optional[List[str]] = None,
+    video_agg: str = "mean",
 ) -> dict:
     """
     Compute AUC-ROC, EER, AP, accuracy@best-threshold,
@@ -690,12 +808,15 @@ def compute_deepfake_metrics(
     results["acc_best_thresh"] = (preds == labels).mean()
     results["best_threshold"] = best_thresh
 
-    # Video-level AUC
+    # Video-level AUC. `max` pools a video to its most-suspicious clip, `mean` to
+    # its average — a real difference on long videos with a few tampered clips,
+    # so it comes from EvalConfig rather than being hardcoded.
     if video_paths is not None:
         vdf = pd.DataFrame({
             "video": video_paths, "label": labels, "score": scores
         })
-        vid_agg = vdf.groupby("video").agg({"label": "first", "score": "mean"})
+        agg = video_agg if video_agg in ("mean", "max") else "mean"
+        vid_agg = vdf.groupby("video").agg({"label": "first", "score": agg})
         if vid_agg["label"].nunique() > 1:
             results["video_auc"] = roc_auc_score(
                 vid_agg["label"], vid_agg["score"]
@@ -708,11 +829,11 @@ def compute_deepfake_metrics_by_compression(
     labels: np.ndarray,
     scores: np.ndarray,
     datasets: List[str],    # or compression label column
+    tags: Sequence[str] = ("c23", "c40"),
 ) -> dict:
     """Compute AUC per compression type (c23, c40) based on dataset column."""
     results = {}
-    ds_arr = np.array(datasets)
-    for tag in ["c23", "c40"]:
+    for tag in tags:
         mask = np.array([tag.lower() in d.lower() for d in datasets])
         if mask.sum() > 0 and len(np.unique(labels[mask])) > 1:
             results[f"auc_{tag}"] = roc_auc_score(labels[mask], scores[mask])
@@ -723,6 +844,7 @@ def compute_spoof_metrics(
     labels: np.ndarray,
     scores: np.ndarray,
     threshold: float = 0.5,
+    fpr_threshold: float = 0.01,
 ) -> dict:
     """
     Compute APCER, BPCER, ACER, HTER, TPR@FPR=1%.
@@ -758,11 +880,15 @@ def compute_spoof_metrics(
         "hter": hter,
     })
 
-    # TPR @ FPR=1%
+    # TPR @ FPR=fpr_threshold (1% by default). The interpolation is only valid
+    # inside the ROC's observed FPR range — a tiny bona-fide set can have a
+    # minimum FPR above the threshold, which would extrapolate silently.
     if len(np.unique(labels)) > 1:
         fpr, tpr, _ = roc_curve(labels, scores)
-        tpr_at_1fpr = float(interp1d(fpr, tpr)(0.01)) if 0.01 <= fpr.max() else float("nan")
-        results["tpr_at_fpr1"] = tpr_at_1fpr
+        in_range = fpr.min() <= fpr_threshold <= fpr.max()
+        results[f"tpr_at_fpr{int(round(fpr_threshold * 100))}"] = (
+            float(interp1d(fpr, tpr)(fpr_threshold)) if in_range else float("nan")
+        )
         results["auc"] = roc_auc_score(labels, scores)
 
     return results
@@ -772,16 +898,12 @@ def compute_temporal_metrics(
     labels: np.ndarray,
     scores: np.ndarray,
 ) -> dict:
-    """Compute binary accuracy, AUC, and deepfake-AUC for temporal head."""
+    """Compute binary accuracy and AUC for the temporal head's classifier logit."""
     results = {}
     preds = (scores >= 0.5).astype(int)
     results["bin_acc"] = (preds == labels).mean()
     if len(np.unique(labels)) > 1:
         results["auc"] = roc_auc_score(labels, scores)
-        fake_mask = labels == 1
-        real_mask = labels == 0
-        if fake_mask.sum() > 0 and real_mask.sum() > 0:
-            results["df_auc"] = roc_auc_score(labels, scores)
     return results
 
 
@@ -1206,6 +1328,20 @@ class Trainer:
         self.temporal_logit_weight = getattr(
             cfg.model, "temporal_logit_loss_weight", 1.0
         )
+        # Supervises TemporalHead.flow_encoder. Zero unless flow is actually
+        # loaded, so the encoder never receives a loss term it has no input for.
+        self.flow_loss_weight = (
+            float(tc.flow_loss_weight) if tc.use_optical_flow else 0.0
+        )
+        if tc.use_optical_flow and mc.temporal_supervision == "cosine_sim":
+            # flow_encoder is None under this supervision mode, so TemporalHead
+            # would drop the loaded flow on the floor — the .npz reads would cost
+            # I/O for nothing. Warn rather than raise: the run is still valid.
+            self.logger.warning(
+                "use_optical_flow=True but temporal_supervision='cosine_sim' — "
+                "no flow encoder is built, so the loaded flow is ignored. Set "
+                "temporal_supervision to 'optical_flow' or 'combined'."
+            )
 
         # ── Optimizer (differential LR for backbone vs heads) ─────────
         base_model   = self.model.module if self.use_multi_gpu else self.model
@@ -1220,6 +1356,7 @@ class Trainer:
                 {"params": head_params,     "lr": tc.lr},
                 {"params": backbone_params, "lr": tc.lr * mc.backbone_lr_scale},
             ],
+            betas=tuple(tc.betas),
             weight_decay=tc.weight_decay,
         )
         # Exactly the parameters the optimizer steps. Gradient clipping and
@@ -1577,7 +1714,6 @@ class Trainer:
         Returns a flat dict of all task metrics ready for logging.
         """
         self.model.eval()
-        base_model = self.model.module if self.use_multi_gpu else self.model
 
         # Accumulators
         df_labels,  df_scores,  df_videos  = [], [], []
@@ -1594,9 +1730,13 @@ class Trainer:
             tmp_lbl = batch["temporal_label"].to(self.device, non_blocking=True).float()
             videos  = batch.get("video_id", [""] * frames.size(0))
             datasets= batch.get("dataset",  [""] * frames.size(0))
+            # Present only when use_optical_flow is on and the .npz files exist.
+            flow    = batch.get("flow")
+            if flow is not None:
+                flow = flow.to(self.device, non_blocking=True)
 
             with self.autocast_ctx:
-                out = self.model(frames)
+                out = self.model(frames, flow=flow)
 
                 df_logit  = out["deepfake_logit"].flatten()
                 sp_logit  = out["spoof_logit"].flatten()
@@ -1608,6 +1748,8 @@ class Trainer:
                     out["temp_proj"], tmp_lbl,
                     logit=tmp_logit,
                     logit_weight=self.temporal_logit_weight,
+                    flow_score=out.get("flow_consistency"),
+                    flow_weight=self.flow_loss_weight,
                 )
 
             running_loss["df"]   += l_df.item()
@@ -1638,12 +1780,20 @@ class Trainer:
         tmp_scores = np.concatenate(tmp_scores)
         tmp_labels = np.concatenate(tmp_labels)
 
-        # Compute metrics
-        df_metrics  = compute_deepfake_metrics(df_labels, df_scores, df_videos)
-        sp_metrics  = compute_spoof_metrics(sp_labels, sp_scores)
+        # Compute metrics. EvalConfig drives the thresholds/labels so an
+        # ablation can change them in one place instead of editing three
+        # hardcoded literals inside the metric functions.
+        ec = self.cfg.eval
+        df_metrics  = compute_deepfake_metrics(
+            df_labels, df_scores, df_videos, video_agg=ec.video_agg
+        )
+        sp_metrics  = compute_spoof_metrics(
+            sp_labels, sp_scores, fpr_threshold=ec.fpr_threshold
+        )
         tmp_metrics = compute_temporal_metrics(tmp_labels, tmp_scores)
         comp_metrics= compute_deepfake_metrics_by_compression(
-            np.array(ds_labels), df_scores, ds_datasets
+            np.array(ds_labels), df_scores, ds_datasets,
+            tags=(ec.c23_label, ec.c40_label),
         )
 
         val_losses = {k: v / max(n_batches, 1) for k, v in running_loss.items()}
@@ -1849,9 +1999,13 @@ class Trainer:
             df_lbl  = batch["deepfake_label"].to(self.device, non_blocking=True).float()
             sp_lbl  = batch["spoof_label"].to(self.device, non_blocking=True).float()
             tmp_lbl = batch["temporal_label"].to(self.device, non_blocking=True).float()
+            # Read from disk by the dataset — nothing here computes flow.
+            flow    = batch.get("flow")
+            if flow is not None:
+                flow = flow.to(self.device, non_blocking=True)
 
             with self.autocast_ctx:
-                out    = self.model(frames)
+                out    = self.model(frames, flow=flow)
 
                 l_df   = self.criterion_df(out["deepfake_logit"], df_lbl)
                 l_sp   = self.criterion_sp(out["spoof_logit"],   sp_lbl)
@@ -1859,6 +2013,8 @@ class Trainer:
                     out["temp_proj"], tmp_lbl,
                     logit=out["temp_logit"],
                     logit_weight=self.temporal_logit_weight,
+                    flow_score=out.get("flow_consistency"),
+                    flow_weight=self.flow_loss_weight,
                 )
 
                 # Task weights

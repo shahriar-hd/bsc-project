@@ -63,12 +63,19 @@ num_frames          8          T per clip
 amp_dtype           float16
 grad_checkpointing  True       required — 2426 MiB → OOM without it
 num_workers         2
+use_optical_flow    False      True adds ~0 MiB VRAM (56×56 int8) but needs
+                               preprocessing to have written the .npz files
 ```
 
 ```bash
-# d) Verify the training step still passes end-to-end (~2 min, 1236 MiB peak)
+# d) Verify the training step still passes end-to-end (~2 min, 1225 MiB peak)
 python tests/check_train_step.py
 ```
+
+> Both this and `check_fit_epoch.py` create a `checkpoints/runNN/` directory, and
+> the latter leaves a ~200 MB checkpoint behind. `resume=True` picks the
+> highest-numbered run, so clear them before the real launch — otherwise the
+> detached run silently continues a 6-clip debug checkpoint.
 
 ---
 
@@ -178,7 +185,9 @@ nvidia-smi --query-gpu=memory.used,memory.free --format=csv
 
 ## 4. If it OOMs anyway
 
-Lower in this order — each step costs less accuracy than the one after it:
+There is **no automatic recovery** — nothing catches `torch.OutOfMemoryError` and
+retries at a smaller batch, so the process dies. Lower these by hand, in order;
+each step costs less accuracy than the one after it:
 
 1. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (if it wasn't set)
 2. Option B — free the desktop's 930 MiB
@@ -187,7 +196,9 @@ Lower in this order — each step costs less accuracy than the one after it:
 4. `batch_size: 4 → 2` **and** `grad_accum_steps: 4 → 8` — keeps the effective
    batch at 16, so the optimizer trajectory is unchanged; only BatchNorm
    statistics get noisier
-5. `use_pcgrad: False` — PCGrad holds one full gradient copy per task
+5. `use_optical_flow: False` if it was on — the flow tensor itself is small, but
+   `flow_encoder`'s activations are not free
+6. `use_pcgrad: False` — PCGrad holds one full gradient copy per task
 
 Do **not** turn off `grad_checkpointing` to go faster: measured at
 batch_size=4 / num_frames=8 with PCGrad + GradNorm, the run needs 2426 MiB

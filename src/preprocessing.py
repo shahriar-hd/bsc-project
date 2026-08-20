@@ -12,12 +12,17 @@ Directory structure output:
     │   ├── real/
     │   │   ├── sub_000000/
     │   │   │   ├── c0_f000.jpg
-    │   │   │   └── ...
+    │   │   │   ├── ...
+    │   │   │   └── c0_flow.npz     ← precomputed optical flow for clip 0
     │   │   └── sub_000001/
     │   └── fake/
     └── SiW-Mv2/
         ├── real/
         └── spoof/
+
+Optical flow is produced here and nowhere else (see src/utils/flow_utils.py).
+train.py only reads these files, and only when TrainConfig.use_optical_flow is
+on — Farneback is far too slow to run inside a dataloader worker.
 
 Clip sampling (dense, stride depends on label):
   FF++  real  → clip_stride_real    (sparse)
@@ -51,6 +56,11 @@ import numpy as np
 
 from src.config import Config, PreprocessConfig, get_config
 from src.utils.face_utils import FaceDetector
+from src.utils.flow_utils import (
+    compute_clip_flow,
+    flow_path_for_clip,
+    save_clip_flow,
+)
 from src.utils.logger_utils import log_banner, setup_logger
 from src.utils.power_utils import power_monitor_from_config
 from src.utils.repro_utils import set_seed
@@ -318,6 +328,25 @@ def extract_clip(
             "src_frame_idx": src_idx,
             "clip_start_frame": start_frame,
         })
+
+    # Optical flow, computed here and only here. Pair k is the flow from saved
+    # frame k to k+1, so it is indexed by `frame_num` and stays aligned however
+    # the training loader later samples or jitters the clip.
+    if config.precompute_optical_flow:
+        try:
+            flow = compute_clip_flow(
+                [c for _, _, c in valid_crops],
+                resize=config.flow_resize,
+                method=config.optical_flow_method,
+            )
+            save_clip_flow(
+                flow_path_for_clip(records[0]["frame_path"], clip_idx), flow
+            )
+        except Exception as exc:                       # noqa: BLE001
+            # A missing flow file degrades to a warning at training time, so
+            # losing one clip's flow must not cost us its frames.
+            logger.warning("Flow failed for clip %d of %s: %s: %s",
+                           clip_idx, video_path.name, type(exc).__name__, exc)
 
     return records
 # =========================================================================== #
@@ -805,6 +834,16 @@ def run_pipeline(cfg: Config) -> None:
         "Quality gate: score>=%.2f | window IoU>=%.2f | min_valid=%d",
         config.min_face_score, config.disp_ratio, config.min_valid_frames,
     )
+    if config.precompute_optical_flow:
+        logger.info(
+            "Optical flow: %s at %dpx → c<clip>_flow.npz beside the crops "
+            "(int8, ~%.1f KB/clip). Training reads these; it never computes flow.",
+            config.optical_flow_method, config.flow_resize,
+            (config.frames_per_clip - 1) * 2 * config.flow_resize ** 2 / 1024,
+        )
+    else:
+        logger.info("Optical flow precompute: OFF "
+                    "(TrainConfig.use_optical_flow will have nothing to read)")
 
     records: List[VideoMeta] = []
     records.extend(scan_ff(config))
