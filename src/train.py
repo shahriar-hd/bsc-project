@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.checkpoint import checkpoint
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, Sampler
 from torchvision import transforms
 
 import timm
@@ -36,7 +36,9 @@ from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from sklearn.metrics import (
     roc_auc_score, average_precision_score,
-    roc_curve, confusion_matrix
+    roc_curve, confusion_matrix,
+    balanced_accuracy_score, matthews_corrcoef,
+    precision_recall_fscore_support,
 )
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
@@ -83,6 +85,12 @@ def get_last_run_id(checkpoint_root: str) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Numeric task ids. Emitted per sample so the loss/metric masks can index a
+# tensor; the human-readable "task" string is kept alongside for logging.
+TASK_DEEPFAKE = 0
+TASK_SPOOF = 1
+
 
 def build_transforms(cfg: Config, is_train: bool) -> A.Compose:
     """Build albumentations pipeline."""
@@ -270,22 +278,40 @@ class MTLDataset(Dataset):
         task = clip["task"]
         binary_label = clip["label"]  # 0=real/live, 1=fake/spoof
 
+        # The off-task label is a placeholder that carries no information: a
+        # FaceForensics++ clip says nothing about presentation attacks and a
+        # SiW-Mv2 clip says nothing about face swapping. `task_id` is what lets
+        # the training and validation loops mask it out — without the mask these
+        # zeros teach the spoof head "a deepfake face is bona-fide" and the
+        # deepfake head "a presentation attack is real".
         if task == "deepfake":
             deepfake_label = binary_label
-            spoof_label = 0  # placeholder
+            spoof_label = 0                      # placeholder — masked by task_id
         else:  # anti-spoof
-            deepfake_label = 0  # placeholder
+            deepfake_label = 0                   # placeholder — masked by task_id
             spoof_label = binary_label
 
-        temporal_label = binary_label  # temporal
+        # Supervised on the whole batch by design: "inauthentic" means the same
+        # thing in both datasets (a swapped face and a replayed screen are both
+        # non-genuine capture), so this label is real ground truth either way.
+        temporal_label = binary_label
 
         sample = {
             "frames": frames_tensor,
             "deepfake_label": torch.tensor(deepfake_label, dtype=torch.long),
             "spoof_label": torch.tensor(spoof_label, dtype=torch.long),
             "temporal_label": torch.tensor(temporal_label, dtype=torch.long),
+            # int, not the `task` string: default_collate turns strings into a
+            # python list, which cannot index a tensor. TASK_DEEPFAKE/TASK_SPOOF.
+            "task_id": torch.tensor(
+                TASK_DEEPFAKE if task == "deepfake" else TASK_SPOOF,
+                dtype=torch.long,
+            ),
             "task": task,
             "dataset": clip["dataset"],
+            # Per-attack-type recall needs this at eval time. Stays a string —
+            # it is only ever used to group numpy arrays, never to index a tensor.
+            "spoof_type": clip["spoof_type"],
             "video_id": clip["video_path"],  # video_path
         }
         # The key is present for every sample or for none — a mixed batch would
@@ -297,6 +323,95 @@ class MTLDataset(Dataset):
 
 
 
+class InterleavedBatchSampler(Sampler[List[int]]):
+    """Fixed per-batch quota of FF++ and SiW-Mv2 indices into a ConcatDataset.
+
+    Replaces the WeightedRandomSampler this loader used to build. That sampler
+    took ``ff_sample_ratio`` as a *weight* — ``siw_weight = (1 - ratio) / n_siw``
+    — so ``ratio = 1.0`` gave every SiW-Mv2 clip a weight of exactly 0.0.
+    ``torch.multinomial`` never draws a zero-weight index, so run01 trained for
+    14 epochs without a single anti-spoof sample: ``loss_sp`` hit exactly 0.0
+    from epoch 2 and the spoof head's output ceiling ended at 0.4978.
+
+    A quota is stronger than fixing the weight to 0.5. With plain weighted
+    sampling, P(no SiW in a batch of 4) is 6.25%, and an empty task mask makes
+    the masked loss a constant: no gradient for PCGrad to project (zero-norm
+    task vector) and a degenerate L(0) seed for GradNorm. Here every batch
+    contains at least one sample of each task by construction, so the masks in
+    `_train_epoch` are always non-empty and neither algorithm needs a special
+    case.
+
+    The two datasets are shuffled and recycled independently: an epoch is as
+    long as the dataset that needs the most batches to be seen once, and the
+    smaller one wraps around (reshuffled each time) rather than truncating the
+    larger.
+    """
+
+    def __init__(
+        self,
+        n_ff: int,
+        n_siw: int,
+        batch_size: int,
+        ff_per_batch: int,
+        seed: int = 42,
+    ):
+        if n_ff == 0 or n_siw == 0:
+            raise ValueError(
+                f"InterleavedBatchSampler needs both datasets non-empty "
+                f"(got n_ff={n_ff}, n_siw={n_siw})"
+            )
+        self.n_ff = n_ff
+        self.n_siw = n_siw
+        self.ff_per_batch = ff_per_batch
+        self.siw_per_batch = batch_size - ff_per_batch
+        self.seed = seed
+        self.epoch = 0
+        # ConcatDataset([ff_ds, siw_ds]) lays SiW out after FF++.
+        self.siw_offset = n_ff
+        # Ceiling, not floor: with 1085 SiW clips at 2 per batch, floor gives 542
+        # batches = 1084 samples and leaves one clip unseen every epoch. Rounding
+        # up costs at most one extra batch and the pool-wrap below fills the last
+        # slot, so "an epoch shows every clip of the larger dataset once" is
+        # actually true rather than nearly true.
+        self.num_batches = max(
+            -(-self.n_ff // self.ff_per_batch),
+            -(-self.n_siw // self.siw_per_batch),
+        )
+
+    def set_epoch(self, epoch: int) -> None:
+        """Reshuffle differently each epoch (the loader is rebuilt per fit, not per epoch)."""
+        self.epoch = epoch
+
+    def _shuffled(self, n: int, g: torch.Generator) -> List[int]:
+        return torch.randperm(n, generator=g).tolist()
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        ff_pool = self._shuffled(self.n_ff, g)
+        siw_pool = self._shuffled(self.n_siw, g)
+        ff_i = siw_i = 0
+
+        for _ in range(self.num_batches):
+            batch = []
+            for _ in range(self.ff_per_batch):
+                if ff_i >= self.n_ff:                  # exhausted → reshuffle
+                    ff_pool = self._shuffled(self.n_ff, g)
+                    ff_i = 0
+                batch.append(ff_pool[ff_i])
+                ff_i += 1
+            for _ in range(self.siw_per_batch):
+                if siw_i >= self.n_siw:
+                    siw_pool = self._shuffled(self.n_siw, g)
+                    siw_i = 0
+                batch.append(self.siw_offset + siw_pool[siw_i])
+                siw_i += 1
+            yield batch
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+
 def build_interleaved_loader(
     ff_df: pd.DataFrame,
     siwmv2_df: pd.DataFrame,
@@ -304,8 +419,9 @@ def build_interleaved_loader(
     is_train: bool
 ) -> DataLoader:
     """
-    Build a DataLoader that interleaves FF++ and SiW-Mv2 samples
-    via WeightedRandomSampler so each batch has both datasets.
+    Build a DataLoader over both datasets. In training, an
+    `InterleavedBatchSampler` guarantees a fixed quota of each task per batch
+    (see that class for why a quota, not a sampling weight).
     """
     ff_ds = MTLDataset(ff_df, cfg, is_train)
     siw_ds = MTLDataset(siwmv2_df, cfg, is_train)
@@ -334,27 +450,49 @@ def build_interleaved_loader(
     from torch.utils.data import ConcatDataset
     combined = ConcatDataset([ff_ds, siw_ds])
 
-    ratio = cfg.train.ff_sample_ratio
-    # Equal weight within each dataset, ratio controls dataset balance
-    ff_weight = ratio / max(len(ff_ds), 1)
-    siw_weight = (1 - ratio) / max(len(siw_ds), 1)
-    weights = (
-        [ff_weight] * len(ff_ds) +
-        [siw_weight] * len(siw_ds)
-    )
-    sampler = WeightedRandomSampler(
-        weights, num_samples=len(combined), replacement=True
-    ) if is_train else None
-
-    return DataLoader(
-        combined,
-        batch_size=cfg.train.batch_size,
-        sampler=sampler,
-        shuffle=(not is_train and sampler is None),
+    common = dict(
         num_workers=cfg.train.num_workers,
         pin_memory=cfg.train.pin_memory and torch.cuda.is_available(),
-        drop_last=is_train,
+        worker_init_fn=worker_init_fn,
     )
+
+    if not is_train:
+        return DataLoader(
+            combined,
+            batch_size=cfg.train.batch_size,
+            shuffle=False,
+            drop_last=False,
+            **common,
+        )
+
+    # `ff_sample_ratio` is the FF++ *share of each batch*. Clamped to leave at
+    # least one slot for each task, so no value of it can starve a head — 1.0
+    # used to mean "100% FF++", which is exactly what broke run01.
+    bs = cfg.train.batch_size
+    if bs < 2:
+        raise ValueError(
+            f"batch_size must be >= 2 to fit both tasks in a batch (got {bs})"
+        )
+    ff_per_batch = int(round(cfg.train.ff_sample_ratio * bs))
+    ff_per_batch = max(1, min(bs - 1, ff_per_batch))
+
+    batch_sampler = InterleavedBatchSampler(
+        n_ff=len(ff_ds),
+        n_siw=len(siw_ds),
+        batch_size=bs,
+        ff_per_batch=ff_per_batch,
+        seed=cfg.train.seed,
+    )
+    logger.info(
+        "Train batches: %d/batch = %d FF++ + %d SiW-Mv2 | %d batches/epoch "
+        "(ff=%d clips, siw=%d clips, ff_sample_ratio=%.2f)",
+        bs, ff_per_batch, bs - ff_per_batch, len(batch_sampler),
+        len(ff_ds), len(siw_ds), cfg.train.ff_sample_ratio,
+    )
+
+    # With batch_sampler, batch_size/shuffle/drop_last must not be set — the
+    # sampler yields complete index lists and every batch is full by construction.
+    return DataLoader(combined, batch_sampler=batch_sampler, **common)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -774,22 +912,117 @@ def get_flat_grads(
 # Metrics
 # ──────────────────────────────────────────────────────────────────────────────
 
+def binary_classification_metrics(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    threshold: float = 0.5,
+) -> dict:
+    """Threshold metrics + ranking metrics + collapse diagnostics for one head.
+
+    Shared by all three heads so the same definitions are used everywhere. The
+    threshold-dependent block is the part that was missing from run01: the spoof
+    head had `recall = 0.0` and `f1 = 0.0` from epoch 2, while the ACER that was
+    actually being logged sat at exactly 0.5 — the value a coin flip produces —
+    so nothing in the logs distinguished a dead head from a mediocre one.
+
+    The `pred_pos_rate` / `score_*` block exists for the same reason. A head
+    whose global maximum output is 0.4978 can never cross a 0.5 threshold, and
+    that fact is invisible in any rate-based metric.
+
+    Returns {} when the split is single-class, matching the other metric
+    functions: no metrics rather than misleading ones.
+    """
+    results: dict = {}
+    if len(np.unique(labels)) < 2:
+        return results
+
+    labels = np.asarray(labels).astype(int)
+    scores = np.asarray(scores, dtype=float)
+    preds = (scores >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels, preds, average="binary", zero_division=0
+    )
+
+    results.update({
+        # ── threshold metrics @ `threshold` ──
+        "acc": float((preds == labels).mean()),
+        "balanced_acc": float(balanced_accuracy_score(labels, preds)),
+        "precision": float(precision),
+        "recall": float(recall),                              # = TPR = 1 - APCER
+        "specificity": float(tn / (tn + fp)) if (tn + fp) else float("nan"),
+        "f1": float(f1),
+        "mcc": float(matthews_corrcoef(labels, preds)),
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+        # ── threshold-free ──
+        "auc_roc": float(roc_auc_score(labels, scores)),
+        "ap": float(average_precision_score(labels, scores)),
+        # ── support ──
+        "n_pos": int((labels == 1).sum()),
+        "n_neg": int((labels == 0).sum()),
+        # ── collapse diagnostics ──
+        "pred_pos_rate": float(preds.mean()),
+        "score_min": float(scores.min()),
+        "score_max": float(scores.max()),
+        "score_mean_pos": float(scores[labels == 1].mean()),
+        "score_mean_neg": float(scores[labels == 0].mean()),
+    })
+    return results
+
+
+def collapse_warnings(
+    name: str,
+    metrics: dict,
+    threshold: float = 0.5,
+) -> List[str]:
+    """Human-readable reasons to distrust `metrics`, or [] if the head looks alive.
+
+    Called from validate() so a dead head is reported the epoch it dies. Each
+    condition here was true of run01's spoof head from epoch 1 and produced no
+    log line at all.
+    """
+    if not metrics:
+        return []
+    msgs = []
+    rate = metrics.get("pred_pos_rate")
+    if rate == 0.0:
+        msgs.append(
+            f"{name}: predicts class 0 for every sample "
+            f"(recall={metrics.get('recall', float('nan')):.4f}, "
+            f"f1={metrics.get('f1', float('nan')):.4f}) — head has collapsed"
+        )
+    elif rate == 1.0:
+        msgs.append(f"{name}: predicts class 1 for every sample — head has collapsed")
+    if metrics.get("score_max", 1.0) < threshold:
+        msgs.append(
+            f"{name}: max score {metrics['score_max']:.4f} < threshold {threshold} "
+            f"— no input can ever be classified positive"
+        )
+    if metrics.get("auc_roc", 1.0) < 0.5:
+        msgs.append(
+            f"{name}: AUC {metrics['auc_roc']:.4f} is below chance — scores are "
+            f"anti-correlated with labels (mean_pos={metrics['score_mean_pos']:.4f} "
+            f"< mean_neg={metrics['score_mean_neg']:.4f})"
+        )
+    return msgs
+
+
 def compute_deepfake_metrics(
     labels: np.ndarray,
     scores: np.ndarray,
     video_paths: Optional[List[str]] = None,
     video_agg: str = "mean",
+    threshold: float = 0.5,
 ) -> dict:
     """
-    Compute AUC-ROC, EER, AP, accuracy@best-threshold,
-    and video-level AUC if video_paths provided.
+    Full binary metric set (see binary_classification_metrics) plus the
+    deepfake-specific extras: EER, accuracy at the Youden-J threshold, and
+    video-level AUC.
     """
-    results = {}
-    if len(np.unique(labels)) < 2:
+    results = binary_classification_metrics(labels, scores, threshold=threshold)
+    if not results:
         return results
-
-    results["auc_roc"] = roc_auc_score(labels, scores)
-    results["ap"] = average_precision_score(labels, scores)
 
     fpr, tpr, thresholds = roc_curve(labels, scores)
     # EER
@@ -845,12 +1078,21 @@ def compute_spoof_metrics(
     scores: np.ndarray,
     threshold: float = 0.5,
     fpr_threshold: float = 0.01,
+    spoof_types: Optional[Sequence[str]] = None,
 ) -> dict:
     """
-    Compute APCER, BPCER, ACER, HTER, TPR@FPR=1%.
+    Full binary metric set (see binary_classification_metrics) plus the
+    anti-spoofing conventions: APCER, BPCER, ACER, HTER, TPR@FPR=1%, and
+    per-attack-type recall when `spoof_types` is given.
+
     labels: 0=real (bona-fide), 1=attack.
+
+    Note APCER == 1 - recall and BPCER == 1 - specificity; both are kept because
+    the anti-spoofing literature reports them under these names. ACER is *not*
+    a substitute for recall: it is exactly 0.5 for a head that predicts one class
+    for everything, which is how run01's collapse stayed invisible for 14 epochs.
     """
-    results = {}
+    results = binary_classification_metrics(labels, scores, threshold=threshold)
     preds = (scores >= threshold).astype(int)
 
     # APCER: Attack Presentation Classification Error Rate
@@ -891,19 +1133,40 @@ def compute_spoof_metrics(
         )
         results["auc"] = roc_auc_score(labels, scores)
 
+    # Per-attack-type recall. The attack types are 11.7x imbalanced (10916 frames
+    # for Partial_FunnyeyeGlasses vs 934 for Silicone), so an aggregate recall can
+    # look healthy while entire attack families are never caught. `n_` is emitted
+    # next to each rate because a recall over 2 test clips is not a measurement.
+    if spoof_types is not None:
+        types = np.asarray(spoof_types)
+        for st in sorted({t for t, lb in zip(types, labels) if lb == 1}):
+            m = (types == st) & attack_mask
+            if m.sum() == 0:
+                continue
+            results[f"recall_{st}"] = float((preds[m] == 1).mean())
+            results[f"n_{st}"] = int(m.sum())
+
     return results
 
 
 def compute_temporal_metrics(
     labels: np.ndarray,
     scores: np.ndarray,
+    threshold: float = 0.5,
 ) -> dict:
-    """Compute binary accuracy and AUC for the temporal head's classifier logit."""
-    results = {}
-    preds = (scores >= 0.5).astype(int)
-    results["bin_acc"] = (preds == labels).mean()
-    if len(np.unique(labels)) > 1:
-        results["auc"] = roc_auc_score(labels, scores)
+    """Full binary metric set for the temporal head's classifier logit.
+
+    `bin_acc` is kept as an alias of `acc` so existing history files and the
+    thesis tables stay readable.
+    """
+    results = binary_classification_metrics(labels, scores, threshold=threshold)
+    if not results:
+        # Single-class split: accuracy alone is still well defined, and the
+        # temporal head is scored on both val loaders where one may be skewed.
+        preds = (scores >= threshold).astype(int)
+        return {"bin_acc": float((preds == labels).mean())}
+    results["bin_acc"] = results["acc"]
+    results["auc"] = results["auc_roc"]
     return results
 
 
@@ -912,22 +1175,49 @@ def compute_temporal_metrics(
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ResultLogger:
-    """Appends per-epoch metrics to a CSV file."""
+    """Appends per-epoch metrics to a CSV file, tolerating a growing key set.
+
+    The header cannot be fixed from the first row: metric functions return {}
+    on a single-class split, and the per-attack-type keys (`recall_<type>`)
+    only exist for the types present in that epoch's validation batch. The
+    previous version wrote the header once from row 0 but built each
+    `DictWriter` from *that row's* keys, so a later row with different keys was
+    written in a different column order under the old header — silently.
+
+    Fix: keep the union of all keys seen, and rewrite the whole file whenever a
+    new one appears. At ~25 rows the cost is irrelevant.
+    """
 
     def __init__(self, csv_path: str):
         """Initialize with output CSV path."""
         self.path = csv_path
-        self._header_written = os.path.exists(csv_path)
+        self.fieldnames: List[str] = []
+        self.rows: List[dict] = []
+        if os.path.exists(csv_path):
+            # Resuming: adopt the existing rows so a rewrite does not lose them.
+            with open(csv_path, newline="") as f:
+                self.rows = list(csv.DictReader(f))
+            if self.rows:
+                self.fieldnames = list(self.rows[0].keys())
 
     def log(self, row: dict) -> None:
-        """Append one row to the CSV."""
-        mode = "a" if self._header_written else "w"
-        with open(self.path, mode, newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=row.keys())
-            if not self._header_written:
-                writer.writeheader()
-                self._header_written = True
-            writer.writerow(row)
+        """Append one row, rewriting the file if it introduces new columns."""
+        self.rows.append(row)
+        new_keys = [k for k in row if k not in self.fieldnames]
+        if new_keys:
+            self.fieldnames.extend(new_keys)
+            self._rewrite()
+        else:
+            with open(self.path, "a", newline="") as f:
+                csv.DictWriter(
+                    f, fieldnames=self.fieldnames, restval=""
+                ).writerow(row)
+
+    def _rewrite(self) -> None:
+        with open(self.path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames, restval="")
+            writer.writeheader()
+            writer.writerows(self.rows)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -939,34 +1229,57 @@ class EarlyStopping:
 
     Supports both 'max' (e.g. AUC) and 'min' (e.g. ACER) modes.
 
+    Two guards were added after run01, where the monitored composite plateaued
+    within a range of 0.0139 over epochs 3-13 and the run stopped on noise:
+
+    - `min_epochs`: never stop before this epoch. With `warmup_epochs = 3` the
+      backbone learning rate is 3e-9 in epoch 0, so patience counted there
+      measures the schedule rather than the model.
+    - `smooth_window`: the stop decision runs on a rolling mean of the last N
+      values. Best-model selection stays on the raw value (handled by the
+      caller), so smoothing cannot cost you the best checkpoint — it only stops
+      a single lucky epoch from resetting the patience counter.
+
     Args:
-        patience:   number of epochs to wait after last improvement
-        min_delta:  minimum change to qualify as an improvement
-        mode:       'max' to maximize metric, 'min' to minimize
-        metric_key: name of the metric in the val_metrics dict (for logging)
+        patience:      epochs without improvement before stopping
+        min_delta:     minimum change to qualify as an improvement
+        mode:          'max' to maximize metric, 'min' to minimize
+        metric_key:    name of the monitored metric (for logging)
+        min_epochs:    earliest epoch at which stopping may trigger
+        smooth_window: rolling-mean window for the stop decision (1 = off)
     """
 
     def __init__(
         self,
         patience: int = 7,
-        min_delta: float = 1e-4,
+        min_delta: float = 2e-3,
         mode: str = "max",
-        metric_key: str = "primary",
+        metric_key: str = "composite",
+        min_epochs: int = 0,
+        smooth_window: int = 1,
     ) -> None:
         assert mode in ("max", "min"), "mode must be 'max' or 'min'"
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
         self.metric_key = metric_key
+        self.min_epochs = min_epochs
+        self.smooth_window = max(1, smooth_window)
 
         self.best_value: float = float("-inf") if mode == "max" else float("inf")
         self.epochs_without_improvement: int = 0
         self.should_stop: bool = False
+        self.history: List[float] = []
+        self.epochs_seen: int = 0
 
     def _is_improvement(self, current: float) -> bool:
         if self.mode == "max":
             return current > self.best_value + self.min_delta
         return current < self.best_value - self.min_delta
+
+    def _smoothed(self) -> float:
+        window = self.history[-self.smooth_window:]
+        return float(sum(window) / len(window))
 
     def step(self, current_value: float) -> bool:
         """
@@ -978,13 +1291,20 @@ class EarlyStopping:
         Returns:
             True if training should stop, False otherwise.
         """
-        if self._is_improvement(current_value):
-            self.best_value = current_value
+        self.history.append(float(current_value))
+        self.epochs_seen += 1
+        smoothed = self._smoothed()
+
+        if self._is_improvement(smoothed):
+            self.best_value = smoothed
             self.epochs_without_improvement = 0
         else:
             self.epochs_without_improvement += 1
 
-        if self.epochs_without_improvement >= self.patience:
+        if (
+            self.epochs_without_improvement >= self.patience
+            and self.epochs_seen >= self.min_epochs
+        ):
             self.should_stop = True
 
         return self.should_stop
@@ -994,12 +1314,18 @@ class EarlyStopping:
             "best_value": self.best_value,
             "epochs_without_improvement": self.epochs_without_improvement,
             "should_stop": self.should_stop,
+            "history": self.history,
+            "epochs_seen": self.epochs_seen,
         }
 
     def load_state_dict(self, state: dict) -> None:
         self.best_value = state["best_value"]
         self.epochs_without_improvement = state["epochs_without_improvement"]
         self.should_stop = state["should_stop"]
+        # Older checkpoints predate smoothing; an empty history just means the
+        # first resumed epoch is unsmoothed, which is harmless.
+        self.history = list(state.get("history", []))
+        self.epochs_seen = state.get("epochs_seen", len(self.history))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1410,17 +1736,41 @@ class Trainer:
 
         # ── Early stopping ────────────────────────────────────────────
         self.early_stopping: Optional[EarlyStopping] = None
+        # "acer" is the one monitored metric where lower is better. Catching the
+        # mismatch here is cheaper than discovering after 25 epochs that
+        # best.pth tracked the worst ACER seen.
+        if tc.early_stopping_metric == "acer" and tc.early_stopping_mode != "min":
+            raise ValueError(
+                "early_stopping_metric='acer' needs early_stopping_mode='min' "
+                f"(got '{tc.early_stopping_mode}') — ACER is an error rate."
+            )
+        if tc.early_stopping_metric != "acer" and tc.early_stopping_mode != "max":
+            raise ValueError(
+                f"early_stopping_metric='{tc.early_stopping_metric}' is a score, "
+                f"so early_stopping_mode must be 'max' (got '{tc.early_stopping_mode}')"
+            )
+        self.monitor_mode = tc.early_stopping_mode
         if tc.use_early_stopping:
             self.early_stopping = EarlyStopping(
                 patience=tc.early_stopping_patience,
                 min_delta=tc.early_stopping_min_delta,
                 mode=tc.early_stopping_mode,
                 metric_key=tc.early_stopping_metric,
+                min_epochs=tc.early_stopping_min_epochs,
+                smooth_window=tc.early_stopping_smooth_window,
             )
             self.logger.info(
                 f"Early stopping: metric={tc.early_stopping_metric}  "
                 f"mode={tc.early_stopping_mode}  "
-                f"patience={tc.early_stopping_patience}"
+                f"patience={tc.early_stopping_patience}  "
+                f"min_delta={tc.early_stopping_min_delta}  "
+                f"min_epochs={tc.early_stopping_min_epochs}  "
+                f"smooth_window={tc.early_stopping_smooth_window}"
+            )
+        if tc.early_stopping_metric == "composite":
+            self.logger.info(
+                f"Composite metric form: {tc.composite_metric} "
+                f"({'0.5*ff_df_auc_roc + 0.5*siw_sp_auc_roc' if tc.composite_metric == 'auc' else '0.5*ff_df_auc_roc + 0.5*(1 - siw_sp_acer)'})"
             )
 
         # ── Power monitor (shared with preprocessing.py) ──────────────
@@ -1447,10 +1797,13 @@ class Trainer:
 
         # ── Mutable state ─────────────────────────────────────────────
         self.start_epoch  = 0
-        self.best_metric  = -float("inf")
+        # Sign matches monitor_mode so the first epoch is always an improvement
+        # in both directions (an ACER-monitored run starts from +inf).
+        self.best_metric  = -float("inf") if self.monitor_mode == "max" else float("inf")
         self.best_epoch   = 0
         self.history: List[Dict] = []          # kept in-memory; persisted via _save_history
         self.current_batch_size = tc.batch_size
+        self._warned_no_compression = False
 
         self._load_checkpoint()
 
@@ -1653,7 +2006,8 @@ class Trainer:
             )
 
         self.start_epoch = ckpt["epoch"] + 1
-        self.best_metric = ckpt.get("best_metric", -float("inf"))
+        worst = -float("inf") if self.monitor_mode == "max" else float("inf")
+        self.best_metric = ckpt.get("best_metric", worst)
         self.best_epoch  = ckpt.get("best_epoch", 0)
         self.history     = ckpt.get("history", [])
         self.logger.info(
@@ -1712,28 +2066,43 @@ class Trainer:
         """
         Run full validation pass.
         Returns a flat dict of all task metrics ready for logging.
+
+        Each head is scored only on the samples whose task it owns. The
+        off-task label is a placeholder zero (see MTLDataset.__getitem__), so
+        accumulating every head over every sample produced metrics for
+        questions the data cannot answer — that is where run01's `ff_sp_acer`
+        column of `nan` came from, and on a mixed loader it would have been
+        worse than nan: a real number computed against fabricated labels.
+
+        The temporal head is scored on everything by design; its label is
+        genuine in both datasets.
         """
         self.model.eval()
 
         # Accumulators
         df_labels,  df_scores,  df_videos  = [], [], []
-        sp_labels,  sp_scores               = [], []
+        sp_labels,  sp_scores,  sp_types   = [], [], []
         tmp_labels, tmp_scores              = [], []
         ds_labels,  ds_datasets             = [], []   # for per-compression breakdown
         running_loss = {"df": 0.0, "sp": 0.0, "temp": 0.0}
-        n_batches = 0
+        loss_batches = {"df": 0, "sp": 0, "temp": 0}
 
         for batch in tqdm(loader, desc="Validate", leave=False):
             frames  = batch["frames"].to(self.device, non_blocking=True)
             df_lbl  = batch["deepfake_label"].to(self.device, non_blocking=True).float()
             sp_lbl  = batch["spoof_label"].to(self.device, non_blocking=True).float()
             tmp_lbl = batch["temporal_label"].to(self.device, non_blocking=True).float()
+            task_id = batch["task_id"].to(self.device, non_blocking=True)
             videos  = batch.get("video_id", [""] * frames.size(0))
             datasets= batch.get("dataset",  [""] * frames.size(0))
+            types   = batch.get("spoof_type", ["unknown"] * frames.size(0))
             # Present only when use_optical_flow is on and the .npz files exist.
             flow    = batch.get("flow")
             if flow is not None:
                 flow = flow.to(self.device, non_blocking=True)
+
+            m_df = task_id == TASK_DEEPFAKE
+            m_sp = task_id == TASK_SPOOF
 
             with self.autocast_ctx:
                 out = self.model(frames, flow=flow)
@@ -1742,8 +2111,14 @@ class Trainer:
                 sp_logit  = out["spoof_logit"].flatten()
                 tmp_logit = out["temp_logit"].flatten()
 
-                l_df   = self.criterion_df(df_logit, df_lbl)
-                l_sp   = self.criterion_sp(sp_logit, sp_lbl)
+                if m_df.any():
+                    l_df = self.criterion_df(df_logit[m_df], df_lbl[m_df])
+                    running_loss["df"] += l_df.item()
+                    loss_batches["df"] += 1
+                if m_sp.any():
+                    l_sp = self.criterion_sp(sp_logit[m_sp], sp_lbl[m_sp])
+                    running_loss["sp"] += l_sp.item()
+                    loss_batches["sp"] += 1
                 l_temp = temporal_consistency_loss(
                     out["temp_proj"], tmp_lbl,
                     logit=tmp_logit,
@@ -1751,25 +2126,26 @@ class Trainer:
                     flow_score=out.get("flow_consistency"),
                     flow_weight=self.flow_loss_weight,
                 )
-
-            running_loss["df"]   += l_df.item()
-            running_loss["sp"]   += l_sp.item()
             running_loss["temp"] += l_temp.item()
-            n_batches += 1
+            loss_batches["temp"] += 1
 
-            # Collect predictions
-            df_scores.append(torch.sigmoid(df_logit).cpu().numpy())
-            df_labels.append(df_lbl.cpu().numpy())
-            df_videos.extend(videos)
+            # Collect predictions — each head only over the samples it owns.
+            m_df_np = m_df.cpu().numpy()
+            m_sp_np = m_sp.cpu().numpy()
 
-            sp_scores.append(torch.sigmoid(sp_logit).cpu().numpy())
-            sp_labels.append(sp_lbl.cpu().numpy())
+            df_scores.append(torch.sigmoid(df_logit).cpu().numpy()[m_df_np])
+            df_labels.append(df_lbl.cpu().numpy()[m_df_np])
+            df_videos.extend([v for v, keep in zip(videos, m_df_np) if keep])
+
+            sp_scores.append(torch.sigmoid(sp_logit).cpu().numpy()[m_sp_np])
+            sp_labels.append(sp_lbl.cpu().numpy()[m_sp_np])
+            sp_types.extend([t for t, keep in zip(types, m_sp_np) if keep])
 
             tmp_scores.append(torch.sigmoid(tmp_logit).cpu().numpy())
             tmp_labels.append(tmp_lbl.cpu().numpy())
 
-            ds_labels.extend(df_lbl.cpu().tolist())
-            ds_datasets.extend(datasets)
+            ds_labels.extend(df_lbl.cpu().numpy()[m_df_np].tolist())
+            ds_datasets.extend([d for d, keep in zip(datasets, m_df_np) if keep])
 
 
         # Concatenate
@@ -1784,19 +2160,50 @@ class Trainer:
         # ablation can change them in one place instead of editing three
         # hardcoded literals inside the metric functions.
         ec = self.cfg.eval
-        df_metrics  = compute_deepfake_metrics(
-            df_labels, df_scores, df_videos, video_agg=ec.video_agg
+        df_metrics = sp_metrics = {}
+        if len(df_labels):
+            df_metrics = compute_deepfake_metrics(
+                df_labels, df_scores, df_videos,
+                video_agg=ec.video_agg, threshold=ec.decision_threshold,
+            )
+        if len(sp_labels):
+            sp_metrics = compute_spoof_metrics(
+                sp_labels, sp_scores,
+                threshold=ec.decision_threshold,
+                fpr_threshold=ec.fpr_threshold,
+                spoof_types=sp_types,
+            )
+        tmp_metrics = compute_temporal_metrics(
+            tmp_labels, tmp_scores, threshold=ec.decision_threshold
         )
-        sp_metrics  = compute_spoof_metrics(
-            sp_labels, sp_scores, fpr_threshold=ec.fpr_threshold
-        )
-        tmp_metrics = compute_temporal_metrics(tmp_labels, tmp_scores)
-        comp_metrics= compute_deepfake_metrics_by_compression(
+        comp_metrics = compute_deepfake_metrics_by_compression(
             np.array(ds_labels), df_scores, ds_datasets,
             tags=(ec.c23_label, ec.c40_label),
         )
+        # Structurally unavailable with this raw layout rather than merely empty:
+        # the FaceForensics++ DFD actor subset filenames carry no c23/c40 token,
+        # so no row can ever match. Said once so the thesis can state why the
+        # compression analysis is absent instead of it silently reading as "not run".
+        if not comp_metrics and not self._warned_no_compression:
+            self._warned_no_compression = True
+            self.logger.info(
+                "Compression breakdown unavailable: no '%s'/'%s' token in any "
+                "video path. The raw videos here are the DFD actor subset "
+                "(e.g. 01_02__hugging_happy__HASH.mp4), which is not "
+                "compression-tagged.", ec.c23_label, ec.c40_label,
+            )
 
-        val_losses = {k: v / max(n_batches, 1) for k, v in running_loss.items()}
+        # A dead head must announce itself the epoch it dies, not 12 epochs
+        # later when early stopping fires on a plateau.
+        for name, m in (("deepfake head", df_metrics),
+                        ("spoof head", sp_metrics),
+                        ("temporal head", tmp_metrics)):
+            for msg in collapse_warnings(name, m, threshold=ec.decision_threshold):
+                self.logger.warning("COLLAPSE  %s", msg)
+
+        val_losses = {
+            k: running_loss[k] / max(loss_batches[k], 1) for k in running_loss
+        }
 
         metrics = {
             "val_loss_df":   val_losses["df"],
@@ -1863,18 +2270,29 @@ class Trainer:
         # "tmp_bin_acc", then the per-loader merge prepends "ff_"/"siw_". The
         # old "df_auc"/"tmp_acc" lookups matched neither layer and printed nan
         # on every epoch line of every run. Deepfake AUC comes from the FF++
-        # loader and ACER from the SiW-Mv2 loader — the other pairing is
-        # meaningless (there are no attacks in FF++, no fakes in SiW-Mv2).
-        df_auc  = val_metrics.get("ff_df_auc_roc",  float("nan"))
-        sp_acer = val_metrics.get("siw_sp_acer",    float("nan"))
-        tmp_acc = val_metrics.get("ff_tmp_bin_acc", float("nan"))
+        # loader and the spoof metrics from the SiW-Mv2 loader — the other
+        # pairing is meaningless (no attacks in FF++, no fakes in SiW-Mv2).
+        #
+        # sp_f1 and sp_recall are on this line rather than only in the CSV
+        # because they are the two numbers that distinguish a working
+        # anti-spoof head from a dead one. ACER stayed at exactly 0.5 through
+        # run01's entire collapse while both of these were 0.0.
+        nan = float("nan")
+        df_auc  = val_metrics.get("ff_df_auc_roc",  nan)
+        sp_auc  = val_metrics.get("siw_sp_auc_roc", nan)
+        sp_rec  = val_metrics.get("siw_sp_recall",  nan)
+        sp_f1   = val_metrics.get("siw_sp_f1",      nan)
+        tmp_acc = val_metrics.get("ff_tmp_bin_acc", nan)
 
         self.logger.info(
             f"[{epoch:03d}/{tc.num_epochs}]  "
             f"loss={row['loss_total']:.4f}  "
             f"df_auc={df_auc:.4f}  "
-            f"sp_acer={sp_acer:.4f}  "
+            f"sp_auc={sp_auc:.4f}  "
+            f"sp_rec={sp_rec:.4f}  "
+            f"sp_f1={sp_f1:.4f}  "
             f"tmp_acc={tmp_acc:.4f}  "
+            f"comp={val_metrics.get('composite', nan):.4f}  "
             f"lr={lr:.2e}  "
             f"t={elapsed:.0f}s  "
             f"P={power_w:.1f}W"
@@ -1913,19 +2331,8 @@ class Trainer:
             # composite collapsed to 0.5 * (1 - sp_acer): best.pth and early
             # stopping were driven by anti-spoofing alone and the deepfake
             # task had no influence on model selection at all.
-            df_auc  = ff_metrics.get("df_auc_roc")
-            sp_acer = siw_metrics.get("sp_acer")
-            if df_auc is None or sp_acer is None or not np.isfinite(sp_acer):
-                self.logger.warning(
-                    f"composite: df_auc_roc={df_auc} sp_acer={sp_acer} — "
-                    f"metrics guarded on a single-class split return nothing; "
-                    f"the missing term falls back to its worst value"
-                )
-            composite = (
-                (df_auc if df_auc is not None else 0.0) * 0.5 +
-                (1.0 - (sp_acer if sp_acer is not None
-                        and np.isfinite(sp_acer) else 1.0)) * 0.5
-            )
+            composite, comp_terms = self._composite_metric(ff_metrics, siw_metrics)
+            val_metrics.update(comp_terms)
 
             # ── Scheduler step ────────────────────────────────────────
             # Feed the plateau scheduler the same composite that drives
@@ -1945,7 +2352,13 @@ class Trainer:
             power_w    = float(np.mean(self.power_monitor.readings)) if self.power_monitor.readings else 0.0
 
             # ── Best-model tracking ───────────────────────────────────
-            is_best = composite > self.best_metric
+            # On the raw monitored value, not the smoothed one early stopping
+            # uses: smoothing exists to stop a lucky epoch from resetting
+            # patience, not to reject a genuinely best checkpoint.
+            is_best = (
+                composite > self.best_metric if self.monitor_mode == "max"
+                else composite < self.best_metric
+            )
             if is_best:
                 self.best_metric = composite
                 self.best_epoch  = epoch
@@ -1982,6 +2395,71 @@ class Trainer:
     # Single train epoch
     # ------------------------------------------------------------------
 
+    def _composite_metric(
+        self, ff_metrics: Dict, siw_metrics: Dict
+    ) -> Tuple[float, Dict[str, float]]:
+        """The number that drives best.pth, the plateau scheduler and early stopping.
+
+        AUC comes from the FF++ loader and the anti-spoofing terms from the
+        SiW-Mv2 loader; the other pairing is meaningless (no attacks in FF++, no
+        face swaps in SiW-Mv2).
+
+        Both composite forms are always returned for logging, because they
+        disagree in exactly the case that matters. The legacy "acer" form is
+        `0.5 * ff_df_auc + 0.5 * (1 - siw_sp_acer)`, and ACER is exactly 0.5 for
+        a head that predicts one class for everything — so in run01 the second
+        term was frozen at 0.25 for all 14 epochs while the same collapsed head
+        had an AUC of 0.41, i.e. visibly below chance. The "auc" form is the
+        default for that reason.
+
+        Returns (value, extra metric keys to log).
+        """
+        tc = self.cfg.train
+        df_auc  = ff_metrics.get("df_auc_roc")
+        sp_auc  = siw_metrics.get("sp_auc_roc")
+        sp_acer = siw_metrics.get("sp_acer")
+
+        missing = [
+            name for name, v in
+            (("ff_df_auc_roc", df_auc), ("siw_sp_auc_roc", sp_auc),
+             ("siw_sp_acer", sp_acer))
+            if v is None or not np.isfinite(v)
+        ]
+        if missing:
+            self.logger.warning(
+                "composite: %s missing or non-finite — metrics guarded on a "
+                "single-class split return nothing; missing terms fall back to "
+                "their worst value. Check the split's class balance.",
+                ", ".join(missing),
+            )
+
+        def ok(v, worst):
+            return v if v is not None and np.isfinite(v) else worst
+
+        comp_auc  = 0.5 * ok(df_auc, 0.0) + 0.5 * ok(sp_auc, 0.0)
+        comp_acer = 0.5 * ok(df_auc, 0.0) + 0.5 * (1.0 - ok(sp_acer, 1.0))
+
+        terms = {
+            "composite":            comp_auc if tc.composite_metric == "auc" else comp_acer,
+            "composite_auc_form":   comp_auc,
+            "composite_acer_form":  comp_acer,
+        }
+
+        # early_stopping_metric selects what is monitored. It used to be a dead
+        # field: fit() always passed the composite and EarlyStopping.metric_key
+        # was only ever used in log messages.
+        key = tc.early_stopping_metric
+        if key == "df_auc":
+            value = ok(df_auc, 0.0)
+        elif key == "sp_auc":
+            value = ok(sp_auc, 0.0)
+        elif key == "acer":
+            value = ok(sp_acer, 1.0)
+        else:                                   # "composite"
+            value = terms["composite"]
+        terms["monitored"] = value
+        return value, terms
+
     def _train_epoch(self, epoch: int, loader) -> Dict:
         """Run one full training epoch, return averaged loss dict."""
         self.model.train()
@@ -1999,16 +2477,39 @@ class Trainer:
             df_lbl  = batch["deepfake_label"].to(self.device, non_blocking=True).float()
             sp_lbl  = batch["spoof_label"].to(self.device, non_blocking=True).float()
             tmp_lbl = batch["temporal_label"].to(self.device, non_blocking=True).float()
+            task_id = batch["task_id"].to(self.device, non_blocking=True)
             # Read from disk by the dataset — nothing here computes flow.
             flow    = batch.get("flow")
             if flow is not None:
                 flow = flow.to(self.device, non_blocking=True)
 
+            # Each supervised head sees only the samples that carry a real label
+            # for it. The off-task label is a placeholder zero, and training on
+            # it taught the spoof head "a deepfake face is bona-fide" and the
+            # deepfake head "a presentation attack is real" — measured on run01's
+            # best.pth, the deepfake head fired above 0.5 on 12.2% of SiW-Mv2
+            # clips that are all label 0 for it.
+            #
+            # InterleavedBatchSampler guarantees both masks are non-empty in
+            # training, so the empty-mask branch below is only reached by an
+            # oddly-configured loader — it returns a real graph node scaled to
+            # zero rather than nan, which keeps PCGrad and GradNorm well defined.
+            m_df = task_id == TASK_DEEPFAKE
+            m_sp = task_id == TASK_SPOOF
+
             with self.autocast_ctx:
                 out    = self.model(frames, flow=flow)
 
-                l_df   = self.criterion_df(out["deepfake_logit"], df_lbl)
-                l_sp   = self.criterion_sp(out["spoof_logit"],   sp_lbl)
+                l_df = (
+                    self.criterion_df(out["deepfake_logit"].flatten()[m_df], df_lbl[m_df])
+                    if m_df.any() else out["deepfake_logit"].sum() * 0.0
+                )
+                l_sp = (
+                    self.criterion_sp(out["spoof_logit"].flatten()[m_sp], sp_lbl[m_sp])
+                    if m_sp.any() else out["spoof_logit"].sum() * 0.0
+                )
+                # Temporal stays over the whole batch: "inauthentic" is genuine
+                # ground truth in both datasets, so there is nothing to mask.
                 l_temp = temporal_consistency_loss(
                     out["temp_proj"], tmp_lbl,
                     logit=out["temp_logit"],

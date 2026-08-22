@@ -6,6 +6,7 @@ GradNorm's learned state survives resume.
 
     python tests/check_fit_epoch.py
 """
+import csv
 import os
 import sys
 import warnings
@@ -67,23 +68,125 @@ def main():
     assert trainer.history, "no epoch history recorded"
     row = trainer.history[-1]
 
-    # The composite must actually see the deepfake AUC, not the 0.0 default.
+    # The composite must see both heads. The old form was
+    # `0.5*df_auc + 0.5*(1 - sp_acer)`, and ACER is exactly 0.5 for a head that
+    # predicts one class for everything — so run01's second term was frozen at
+    # 0.25 for all 14 epochs while the same collapsed head had AUC 0.41. Both
+    # forms are logged; `composite_metric` selects which one is monitored.
     df_auc = row.get("ff_df_auc_roc")
+    sp_auc = row.get("siw_sp_auc_roc")
     sp_acer = row.get("siw_sp_acer")
-    print(f"[fit ] ff_df_auc_roc={df_auc}  siw_sp_acer={sp_acer}")
-    assert df_auc is not None, f"ff_df_auc_roc absent from row: {sorted(row)}"
-    assert sp_acer is not None, f"siw_sp_acer absent from row: {sorted(row)}"
-    expect = 0.5 * float(df_auc) + 0.5 * (1.0 - float(sp_acer))
-    print(f"[fit ] composite recomputed={expect:.4f} "
-          f"best_metric={trainer.best_metric:.4f}")
-    assert abs(expect - trainer.best_metric) < 1e-6, \
-        "composite does not match 0.5*df_auc + 0.5*(1-sp_acer)"
-    assert trainer.best_metric > 0.0, "composite is zero — df_auc term is dead"
+    print(f"[fit ] ff_df_auc_roc={df_auc}  siw_sp_auc_roc={sp_auc}  "
+          f"siw_sp_acer={sp_acer}")
+    for name, v in (("ff_df_auc_roc", df_auc), ("siw_sp_auc_roc", sp_auc),
+                    ("siw_sp_acer", sp_acer)):
+        assert v is not None, f"{name} absent from row: {sorted(row)}"
+
+    form = cfg.train.composite_metric
+    expect_auc = 0.5 * float(df_auc) + 0.5 * float(sp_auc)
+    expect_acer = 0.5 * float(df_auc) + 0.5 * (1.0 - float(sp_acer))
+    expect = expect_auc if form == "auc" else expect_acer
+    print(f"[fit ] composite_metric={form!r}  auc form={expect_auc:.4f}  "
+          f"acer form={expect_acer:.4f}  best_metric={trainer.best_metric:.4f}")
+    assert abs(expect - trainer.best_metric) < 1e-6, (
+        f"composite does not match the {form} form ({expect:.6f} vs "
+        f"{trainer.best_metric:.6f})")
+    assert trainer.best_metric > 0.0, "composite is zero — both terms are dead"
+
+    # Both forms must be logged regardless of which one is monitored, so the
+    # thesis can quote the old definition without re-running anything.
+    for k in ("composite", "composite_auc_form", "composite_acer_form"):
+        assert k in row, f"{k} missing from the logged row: {sorted(row)}"
+    assert abs(float(row["composite_auc_form"]) - expect_auc) < 1e-6
+    assert abs(float(row["composite_acer_form"]) - expect_acer) < 1e-6
+    print(f"[fit ] logged both forms: auc={row['composite_auc_form']:.4f} "
+          f"acer={row['composite_acer_form']:.4f}")
+
+    # The per-attack-type table that decides whether *more data* is needed, and
+    # for which type. Empty here only if the subsample kept one type.
+    per_type = sorted(k for k in row if k.startswith("siw_sp_recall_"))
+    print(f"[fit ] per-type recall in the row ({len(per_type)}): "
+          f"{[k.replace('siw_sp_recall_', '') for k in per_type]}")
+    assert per_type, "no siw_sp_recall_<type> keys reached the epoch row"
+
+    # ── Early stopping guards ──────────────────────────────────────────
+    es = T.EarlyStopping(patience=2, min_delta=2e-3, mode="max",
+                         min_epochs=8, smooth_window=3)
+    flat = [0.70] * 12                     # a dead-flat plateau
+    stops = [es.step(v) for v in flat]
+    first_stop = stops.index(True) + 1 if True in stops else None
+    print(f"[es  ] flat plateau: patience=2 min_epochs=8 -> first stop at "
+          f"epoch {first_stop}")
+    assert first_stop is not None, "early stopping never fired on a flat metric"
+    assert first_stop >= 8, (
+        f"stopped at epoch {first_stop} despite min_epochs=8 — the warmup region "
+        f"(backbone lr 3e-9 at epoch 0) would decide the run")
+
+    # Smoothing must absorb a single lucky epoch instead of locking `best` to it.
+    # This is run01's exact shape: a plateau, one noise spike, then a genuine
+    # climb that never reaches the spike. On raw values the spike becomes an
+    # unbeatable best and patience runs out mid-climb; on a 3-epoch mean the
+    # spike is averaged down and the climb still registers as improvement.
+    spike = [0.70, 0.70, 0.86, 0.72, 0.74, 0.76, 0.78]
+    es2 = T.EarlyStopping(patience=3, min_delta=2e-3, mode="max",
+                          min_epochs=0, smooth_window=3)
+    smoothed = [(es2.step(v), es2.epochs_without_improvement) for v in spike]
+    es3 = T.EarlyStopping(patience=3, min_delta=2e-3, mode="max",
+                          min_epochs=0, smooth_window=1)
+    unsmoothed = [(es3.step(v), es3.epochs_without_improvement) for v in spike]
+    print(f"[es  ] spike series {spike}")
+    print(f"[es  ]   smooth_window=3 (stop, patience): {smoothed}")
+    print(f"[es  ]   smooth_window=1 (stop, patience): {unsmoothed}")
+    assert any(s for s, _ in unsmoothed), (
+        "the unsmoothed series did not stop — this series no longer reproduces "
+        "run01's failure, so the comparison below proves nothing")
+    assert not any(s for s, _ in smoothed), (
+        f"smoothing did not absorb the spike: stopped mid-climb at epoch "
+        f"{[s for s, _ in smoothed].index(True) + 1} while the metric was still "
+        f"rising {spike[3]} -> {spike[-1]}")
+    # min_delta must be above the resolution of the val set: one clip out of
+    # ~200 moves AUC by ~0.005, so the old 1e-4 counted noise as improvement.
+    es4 = T.EarlyStopping(patience=1, min_delta=2e-3, mode="max", min_epochs=0)
+    es4.step(0.70)
+    assert es4.step(0.7005) is True, (
+        "a +0.0005 change was treated as an improvement — min_delta is below the "
+        "resolution of the validation set")
+    print(f"[es  ] min_delta=2e-3 rejects a +0.0005 move as noise")
 
     run_dir = trainer.run_dir
     saved = sorted(f for f in os.listdir(run_dir) if f.endswith(".pth"))
     print(f"[fit ] {run_dir}: {saved}")
     assert "last.pth" in saved and "best.pth" in saved, f"missing ckpt: {saved}"
+
+    # ── results.csv column alignment ───────────────────────────────────
+    # The per-attack-type keys only exist for the types present in an epoch's
+    # validation set, so the key set grows between rows. The header used to be
+    # written once from row 0 while each row was written from its own keys, which
+    # put later values under the wrong columns without any error.
+    csv_path = os.path.join(run_dir, cfg.paths.result_csv)
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        header = list(reader.fieldnames or [])
+        rows = list(reader)
+    print(f"[csv ] {os.path.basename(csv_path)}: {len(header)} columns, "
+          f"{len(rows)} rows")
+    assert "composite" in header and "composite_acer_form" in header, \
+        f"composite columns missing from the CSV header: {header[:12]}..."
+    for i, r in enumerate(rows):
+        assert None not in r, f"row {i} has more fields than the header"
+        assert None not in r.values(), f"row {i} has fewer fields than the header"
+    # A new key on a later row must add a column, not shift the existing ones.
+    rl = T.ResultLogger(os.path.join(run_dir, "_colcheck.csv"))
+    rl.log({"epoch": 0, "a": 1})
+    rl.log({"epoch": 1, "a": 2, "sp_recall_Silicone": 0.5})
+    rl.log({"epoch": 2, "a": 3})
+    with open(os.path.join(run_dir, "_colcheck.csv"), newline="") as f:
+        got = list(csv.DictReader(f))
+    os.remove(os.path.join(run_dir, "_colcheck.csv"))
+    print(f"[csv ] growing key set -> {got}")
+    assert [r["a"] for r in got] == ["1", "2", "3"], \
+        f"a late new column shifted earlier values: {got}"
+    assert got[0]["sp_recall_Silicone"] == "" and got[1]["sp_recall_Silicone"] == "0.5"
 
     # ── Resume round-trip ──────────────────────────────────────────────
     ckpt = torch.load(os.path.join(run_dir, "last.pth"),

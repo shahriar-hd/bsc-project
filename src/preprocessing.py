@@ -49,7 +49,7 @@ import os
 import random
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -190,6 +190,129 @@ def max_clips_for_label(dataset: str, label: str, config: PreprocessConfig) -> i
             else config.max_clips_ff_real
         )
     return specific if specific is not None else config.max_clips_per_video
+
+
+def starts_for_stride(total_frames: int, stride: int, config: PreprocessConfig) -> int:
+    """How many clip starts `compute_clip_starts` would find, ignoring caps."""
+    if stride <= 0:
+        return 0
+    span = clip_span(config)
+    if total_frames < span:
+        return 0
+    margin = effective_margin(total_frames, config)
+    window = (total_frames - margin) - margin - span
+    if window < 0:
+        return 1 if config.min_clips_per_video > 0 else 0
+    return window // stride + 1
+
+
+def stride_for_clip_count(
+    total_frames: int, wanted: int, config: PreprocessConfig
+) -> int:
+    """
+    Smallest stride ≥ `min_spoof_stride` that yields `wanted` clips from a video
+    of `total_frames`, spread as widely as the usable region allows.
+
+    Returns `clip_span` when one clip is enough, so the common case keeps a
+    non-overlapping stride rather than an arbitrarily small one.
+    """
+    span = clip_span(config)
+    if wanted <= 1:
+        return span
+    margin = effective_margin(total_frames, config)
+    window = (total_frames - margin) - margin - span
+    if window <= 0:
+        return span
+    # `wanted` starts spread over `window` frames need this gap between them;
+    # floor keeps the count at or above `wanted`.
+    stride = window // (wanted - 1)
+    return max(config.min_spoof_stride, min(stride, span))
+
+
+def plan_spoof_sampling(
+    records: List[VideoMeta],
+    config: PreprocessConfig,
+) -> Dict[str, Dict[str, int]]:
+    """
+    Choose a stride and a per-video clip cap for each SiW-Mv2 attack type, and
+    write them onto the records so the workers need no extra state.
+
+    Rare attack types get more clips from each of their videos, up to
+    ``max_clips_per_video_spoof`` and never below ``min_spoof_stride``; common
+    types get one clip per video. No video is ever dropped — see
+    ``PreprocessConfig.target_clips_per_spoof_type`` for why balance is narrowed
+    rather than forced.
+
+    Reads frame counts for the spoof videos (~2 s for 915 files, metadata only).
+    Returns a per-type report for logging.
+    """
+    target = config.target_clips_per_spoof_type
+    spoof_records = [
+        r for r in records
+        if str(r["dataset"]) == config.siw_dataset_name and str(r["label"]) == "spoof"
+    ]
+    if target is None or target <= 0 or not spoof_records:
+        return {}
+
+    by_type: Dict[str, List[VideoMeta]] = defaultdict(list)
+    for rec in spoof_records:
+        by_type[str(rec["spoof_type"])].append(rec)
+
+    report: Dict[str, Dict[str, int]] = {}
+    for spoof_type, recs in sorted(by_type.items()):
+        lengths = {}
+        for rec in recs:
+            n = get_frame_count(Path(str(rec["video_path"])))
+            if n > 0:
+                lengths[str(rec["video_path"])] = n
+        if not lengths:
+            logger.warning("No readable videos for spoof type %s", spoof_type)
+            continue
+
+        n_videos = len(lengths)
+        # Clips per video needed to reach the target, capped so overlap stays sane.
+        wanted = max(1, min(config.max_clips_per_video_spoof,
+                            -(-target // n_videos)))          # ceil division
+        median_len = sorted(lengths.values())[n_videos // 2]
+        stride = stride_for_clip_count(median_len, wanted, config)
+
+        produced = 0
+        for rec in recs:
+            n = lengths.get(str(rec["video_path"]), 0)
+            rec["clip_stride"] = stride
+            rec["max_clips"] = wanted
+            produced += min(wanted, starts_for_stride(n, stride, config)) if n else 0
+
+        report[spoof_type] = {
+            "videos": n_videos,
+            "median_frames": median_len,
+            "stride": stride,
+            "clips_per_video": wanted,
+            "clips": produced,
+        }
+
+    if report:
+        counts = [r["clips"] for r in report.values()]
+        span = clip_span(config)
+        logger.info(
+            "Per-attack-type sampling (target %d clips/type, cap %d clips/video, "
+            "min stride %d):", target, config.max_clips_per_video_spoof,
+            config.min_spoof_stride,
+        )
+        for spoof_type, r in sorted(report.items(), key=lambda kv: -kv[1]["clips"]):
+            overlap = max(0, span - r["stride"])
+            logger.info(
+                "  %-26s %3d videos | median %3df | stride %3d (%2df overlap) | "
+                "%d clip/video -> %4d clips",
+                spoof_type, r["videos"], r["median_frames"], r["stride"], overlap,
+                r["clips_per_video"], r["clips"],
+            )
+        logger.info(
+            "  spread %d..%d clips = %.1fx (was 10.5x by video count); the "
+            "remainder is left to per-type sampling weights at training time",
+            min(counts), max(counts), max(counts) / max(min(counts), 1),
+        )
+    return report
 
 
 # =========================================================================== #
@@ -352,9 +475,166 @@ def extract_clip(
 # =========================================================================== #
 # Dataset scanners
 # =========================================================================== #
+def ff_identity_tokens(stem: str) -> List[str]:
+    """
+    Identity tokens encoded in a FaceForensics++ DFD filename.
+
+    real  ``NN__scene``              -> ["NN"]        one actor
+    fake  ``NN_MM__scene__HASH``     -> ["NN", "MM"]  actor NN's face on MM's video
+
+    The identity block is everything before the first ``__``; within it actors
+    are ``_``-separated. Anything that does not parse yields ``[]``, and the
+    caller falls back to a per-video subject so an unrecognised name is never
+    silently merged into someone else's identity.
+    """
+    head = stem.split("__", 1)[0]
+    tokens = [t for t in head.split("_") if t]
+    return tokens if all(t.isdigit() for t in tokens) and tokens else []
+
+
+def build_ff_identity_map(
+    video_paths: Iterable[Path],
+) -> Tuple[Dict[str, str], Dict[str, int]]:
+    """
+    Group FF++ videos into identity components via union-find.
+
+    A fake video names *two* actors, which ties those identities together: if
+    they landed in different splits, that fake's face would appear in one split
+    and its driving video in another. Treating each identity token as a node and
+    each fake as an edge, a connected component is the smallest unit that can be
+    assigned to a split without leaking.
+
+    Returns ``(path_str -> subject_id, stats)``. ``stats`` carries
+    ``n_videos``/``n_identities``/``n_components``/``largest_component_videos``
+    /``n_unparsed`` so the caller can report how well this actually separated —
+    if the actor pairing is dense enough, a single component can swallow most of
+    the corpus and no identity-disjoint split exists.
+    """
+    paths = list(video_paths)
+    parent: Dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    tokens_per_path: Dict[str, List[str]] = {}
+    for vid in paths:
+        tokens = ff_identity_tokens(vid.stem)
+        tokens_per_path[str(vid)] = tokens
+        for tok in tokens:
+            find(tok)
+        for tok in tokens[1:]:
+            union(tokens[0], tok)          # a fake ties its actors together
+
+    # Number components by their smallest identity token so ids are stable
+    # across runs and independent of filesystem ordering.
+    members: Dict[str, List[str]] = defaultdict(list)
+    for tok in parent:
+        members[find(tok)].append(tok)
+    roots = sorted(members, key=lambda r: min(members[r]))
+    comp_of_root = {root: i for i, root in enumerate(roots)}
+
+    subject_of_path: Dict[str, str] = {}
+    videos_per_component: Counter = Counter()
+    n_unparsed = 0
+    for path_str, tokens in tokens_per_path.items():
+        if not tokens:
+            n_unparsed += 1
+            subject_of_path[path_str] = f"ff_vid_{Path(path_str).stem}"
+            continue
+        comp = comp_of_root[find(tokens[0])]
+        subject_of_path[path_str] = f"ff_id{comp:03d}"
+        videos_per_component[comp] += 1
+
+    stats = {
+        "n_videos": len(paths),
+        "n_identities": len(parent),
+        "n_components": len(roots),
+        "largest_component_videos": max(videos_per_component.values(),
+                                        default=0),
+        "n_unparsed": n_unparsed,
+    }
+    return subject_of_path, stats
+
+
+def ff_scene_token(stem: str) -> str:
+    """
+    The scripted-scenario token of a FaceForensics++ DFD filename.
+
+    real  ``NN__scene``           -> "scene"
+    fake  ``NN_MM__scene__HASH``  -> "scene"
+
+    Returns ``""`` when the name has no ``__`` separator, so the caller can fall
+    back to a per-video subject rather than lumping unparsed names together.
+    """
+    parts = stem.split("__")
+    return parts[1] if len(parts) > 1 else ""
+
+
+def build_ff_subject_map(
+    video_paths: Iterable[Path],
+    split_key: str,
+) -> Tuple[Dict[str, str], Dict[str, object]]:
+    """
+    Choose the unit that must not straddle two splits, and report what still does.
+
+    ``split_key`` is ``PreprocessConfig.ff_split_key`` — see that field for the
+    measured trade-off between "scene", "identity" and "video". Whichever is
+    chosen, ``stats`` carries the *residual* overlap of the other unit so the
+    summary can state it instead of implying the split is leak-free.
+    """
+    paths = list(video_paths)
+    if split_key not in ("scene", "identity", "video"):
+        raise ValueError(
+            f"ff_split_key must be 'scene', 'identity' or 'video', got {split_key!r}"
+        )
+
+    ident_map, ident_stats = build_ff_identity_map(paths)
+
+    if split_key == "identity":
+        subject_of_path = ident_map
+    else:
+        subject_of_path = {}
+        for vid in paths:
+            if split_key == "video":
+                subject_of_path[str(vid)] = f"ff_vid_{vid.stem}"
+                continue
+            scene = ff_scene_token(vid.stem)
+            subject_of_path[str(vid)] = (
+                f"ff_scene_{scene}" if scene else f"ff_vid_{vid.stem}"
+            )
+
+    scenes = {ff_scene_token(v.stem) for v in paths} - {""}
+    subjects = set(subject_of_path.values())
+    sizes = Counter(subject_of_path.values())
+    stats: Dict[str, object] = {
+        "split_key": split_key,
+        "n_videos": len(paths),
+        "n_subjects": len(subjects),
+        "largest_subject_videos": max(sizes.values(), default=0),
+        "n_scenes": len(scenes),
+        "n_identities": ident_stats["n_identities"],
+        "n_identity_components": ident_stats["n_components"],
+        "largest_identity_component": ident_stats["largest_component_videos"],
+        "n_unparsed": ident_stats["n_unparsed"],
+    }
+    return subject_of_path, stats
+
+
 def scan_ff(config: PreprocessConfig) -> List[VideoMeta]:
     root = config.raw_data_root / config.ff_dataset_name
-    records: List[VideoMeta] = []
+
+    # Collect first, then resolve subjects: a fake's identity component depends on
+    # the other videos, so it cannot be decided one file at a time.
+    found: List[Tuple[Path, str]] = []
     for label_str, subdir in [
         ("real", config.ff_real_dir),
         ("fake", config.ff_fake_dir),
@@ -365,14 +645,61 @@ def scan_ff(config: PreprocessConfig) -> List[VideoMeta]:
             continue
         for vid in sorted(folder.rglob("*")):
             if vid.suffix.lower() in config.video_extensions:
-                records.append({
-                    "video_path": str(vid),
-                    "dataset": config.ff_dataset_name,
-                    "subject_id": f"ff_{vid.stem}",
-                    "label": label_str,
-                    "task": "deepfake",
-                    "spoof_type": "none",
-                })
+                found.append((vid, label_str))
+
+    subject_of_path, stats = build_ff_subject_map(
+        (v for v, _ in found), config.ff_split_key
+    )
+    logger.info(
+        "FF++ split unit '%s': %d videos -> %d subjects "
+        "(largest holds %d videos, %.1f%%)",
+        stats["split_key"], stats["n_videos"], stats["n_subjects"],
+        stats["largest_subject_videos"],
+        100.0 * int(stats["largest_subject_videos"]) / max(int(stats["n_videos"]), 1),
+    )
+    logger.info(
+        "FF++ structure: %d scenarios | %d actor tokens | %d identity components",
+        stats["n_scenes"], stats["n_identities"], stats["n_identity_components"],
+    )
+    if config.ff_split_key == "scene":
+        logger.info(
+            "FF++ residual: actors are NOT split-disjoint under 'scene' — actor "
+            "overlap between splits is expected and is the accepted trade-off "
+            "(an identity-disjoint split does not exist: %d components, largest "
+            "holds %d of %d videos)",
+            stats["n_identity_components"], stats["largest_identity_component"],
+            stats["n_videos"],
+        )
+    elif config.ff_split_key == "identity":
+        logger.warning(
+            "FF++ residual: all %d fakes reuse a scenario that also appears as a "
+            "real video, and 'identity' does not separate scenarios — source-"
+            "content leakage stays at 100%%",
+            stats["n_videos"] // 2,
+        )
+    else:
+        logger.warning(
+            "FF++ ff_split_key='video': neither actors nor scenarios are split-"
+            "disjoint. Test metrics will be optimistic — this is the run01 setting"
+        )
+    if stats["n_unparsed"]:
+        logger.warning(
+            "%d FF++ filenames did not match the DFD pattern and fall back to "
+            "per-video subjects (leakage possible for those)",
+            stats["n_unparsed"],
+        )
+
+    records: List[VideoMeta] = [
+        {
+            "video_path": str(vid),
+            "dataset": config.ff_dataset_name,
+            "subject_id": subject_of_path[str(vid)],
+            "label": label_str,
+            "task": "deepfake",
+            "spoof_type": "none",
+        }
+        for vid, label_str in found
+    ]
     logger.info("FF++ scanned: %d videos", len(records))
     return records
 
@@ -427,44 +754,121 @@ def split_by_subject(
     """
     Assign train/val/test per *subject*, so no subject appears in two splits.
 
-    Splitting is done per dataset: with one global shuffle a small dataset can
-    land almost entirely in one split, which would silently break validation
-    for that task.
+    What a "subject" is differs by dataset, and only one of them is genuinely
+    identity-aware:
+
+    * **FaceForensics++** — ``PreprocessConfig.ff_split_key`` (default "scene").
+      The DFD actor subset cannot be split identity-disjointly at all; see that
+      field for the measured numbers.
+    * **SiW-Mv2** — one subject **per video**. The filenames carry no token that
+      links the same person across attack types, and no official protocol file
+      ships with the copy here, so there is nothing to group on. This split is
+      per-video and is *not* subject-aware; calling it so would be false.
+
+    Assignment is greedy rather than a slice of a shuffled list. Slicing at
+    ``int(n * ratio)`` balances *subject counts*, but subjects hold different
+    numbers of videos and different real/fake mixes — run01's ff_val came out
+    58/42 against a 49/51 corpus. Here each subject goes to whichever split is
+    currently least full **relative to its quota, per label**, so both the size
+    ratios and the label ratios are tracked. Subjects are visited largest-first
+    (a shuffled order within equal size keeps ``split_seed`` meaningful), since
+    placing the big ones while all splits are still empty is what keeps the tail
+    able to correct the balance.
     """
     by_dataset: Dict[str, List[VideoMeta]] = defaultdict(list)
     for rec in records:
         by_dataset[str(rec["dataset"])].append(rec)
+
+    test_ratio = max(0.0, 1.0 - config.train_ratio - config.val_ratio)
+    targets = {
+        "train": config.train_ratio,
+        "val": config.val_ratio,
+        "test": test_ratio,
+    }
+    targets = {k: v for k, v in targets.items() if v > 0.0}
 
     for dataset_name, ds_records in by_dataset.items():
         subjects: Dict[str, List[VideoMeta]] = defaultdict(list)
         for rec in ds_records:
             subjects[str(rec["subject_id"])].append(rec)
 
-        ids = sorted(subjects.keys())          # sorted → deterministic
+        # Per-subject video count per label, and the corpus totals to scale against.
+        per_subject_labels: Dict[str, Counter] = {
+            sid: Counter(str(r["label"]) for r in recs)
+            for sid, recs in subjects.items()
+        }
+        totals = Counter()
+        for counts in per_subject_labels.values():
+            totals.update(counts)
+
+        ids = sorted(subjects.keys())
         rng = random.Random(config.split_seed)
         rng.shuffle(ids)
+        # Largest first; the shuffle above breaks ties deterministically.
+        ids.sort(key=lambda sid: -len(subjects[sid]))
 
-        n = len(ids)
-        n_train = int(n * config.train_ratio)
-        n_val = int(n * config.val_ratio)
-
-        train_set = set(ids[:n_train])
-        val_set = set(ids[n_train: n_train + n_val])
+        filled: Dict[str, Counter] = {s: Counter() for s in targets}
+        split_of: Dict[str, str] = {}
+        for sid in ids:
+            counts = per_subject_labels[sid]
+            best_split, best_cost = None, None
+            for split, ratio in targets.items():
+                # Fullness after adding, per label: >1 means past quota. The worst
+                # label drives the choice, so a split cannot be balanced overall
+                # while being lopsided on one class.
+                cost = max(
+                    (filled[split][lab] + counts[lab]) / max(ratio * totals[lab], 1e-9)
+                    for lab in totals
+                )
+                if best_cost is None or cost < best_cost:
+                    best_split, best_cost = split, cost
+            split_of[sid] = str(best_split)
+            filled[str(best_split)].update(counts)
 
         for sid, recs in subjects.items():
-            split = (
-                "train" if sid in train_set else
-                "val" if sid in val_set else
-                "test"
-            )
             for rec in recs:
-                rec["split"] = split
+                rec["split"] = split_of[sid]
 
         counts = Counter(str(r["split"]) for r in ds_records)
+        n_subjects = len(subjects)
         logger.info(
             "%-16s split (videos) — train: %d | val: %d | test: %d | subjects: %d",
-            dataset_name, counts["train"], counts["val"], counts["test"], n,
+            dataset_name, counts["train"], counts["val"], counts["test"], n_subjects,
         )
+        for split in targets:
+            lab = filled[split]
+            total = sum(lab.values())
+            if total == 0:
+                logger.warning(
+                    "%s %s split is EMPTY — every metric guarded on class count "
+                    "will return nothing for it", dataset_name, split,
+                )
+                continue
+            mix = "  ".join(f"{k}={v} ({100.0 * v / total:.0f}%)"
+                            for k, v in sorted(lab.items()))
+            logger.info("%-16s   %-5s labels: %s", dataset_name, split, mix)
+            if len(totals) > 1 and min(lab.get(k, 0) for k in totals) == 0:
+                logger.warning(
+                    "%s %s split is single-class — metrics for it will be empty",
+                    dataset_name, split,
+                )
+
+        # FF++ under an identity/scene key must collapse many videos into few
+        # subjects; equality means the grouping silently did nothing.
+        if dataset_name == config.ff_dataset_name:
+            n_videos = len(ds_records)
+            if config.ff_split_key != "video" and n_subjects >= n_videos:
+                logger.warning(
+                    "FF++ has %d subjects for %d videos under ff_split_key=%r — "
+                    "the grouping did not take effect and both actors and "
+                    "scenarios leak across splits",
+                    n_subjects, n_videos, config.ff_split_key,
+                )
+            else:
+                logger.info(
+                    "FF++ grouping check: %d videos -> %d subjects (%.1f videos "
+                    "per subject)", n_videos, n_subjects, n_videos / max(n_subjects, 1),
+                )
 
     return records
 
@@ -488,8 +892,10 @@ def process_video(
         logger.warning("Cannot read: %s", video_path)
         return []
 
-    stride = stride_for_label(dataset, label, config)
-    max_clips = max_clips_for_label(dataset, label, config)
+    # A per-attack-type plan, when one was made, overrides the flat per-label
+    # stride. Carried on the record itself so workers stay stateless.
+    stride = int(meta.get("clip_stride") or stride_for_label(dataset, label, config))
+    max_clips = int(meta.get("max_clips") or max_clips_for_label(dataset, label, config))
     clip_starts = compute_clip_starts(total_frames, stride, config, max_clips=max_clips)
 
     if not clip_starts:
@@ -773,7 +1179,17 @@ def write_all_csvs(
 # =========================================================================== #
 # Summary
 # =========================================================================== #
-def log_summary(all_records: List[Dict]) -> None:
+def log_summary(all_records: List[Dict], config: PreprocessConfig) -> None:
+    """
+    Report the corpus, then check the two properties that silently failed before.
+
+    Counting frames is not enough. `subject_id` used to be `ff_<stem>`, one
+    subject per video, which made every FF++ split subject-disjoint by definition
+    and held nothing back — `Unique subjects == Unique videos == 1938` was the
+    only visible symptom and it read like a coincidence. And the split cut a
+    shuffled list at `int(n * ratio)`, which put ff_val at 58/42 real/fake against
+    ff_train's 49/51. Both are now printed per dataset and warned about.
+    """
     unique_clips = len({(r["video_index"], r["clip_index"]) for r in all_records})
     unique_subjects = len({r["subject_id"] for r in all_records})
 
@@ -787,6 +1203,73 @@ def log_summary(all_records: List[Dict]) -> None:
     logger.info("  By spoof type  : %s", dict(Counter(
         r["spoof_type"] for r in all_records if r["spoof_type"] not in ("none",)
     )))
+
+    # ── grouping: did subject_id actually collapse videos together? ──────────
+    logger.info("  Subject grouping (videos per subject — 1.0 means no grouping):")
+    for dataset in sorted({str(r["dataset"]) for r in all_records}):
+        rows = [r for r in all_records if str(r["dataset"]) == dataset]
+        n_vid = len({r["video_index"] for r in rows})
+        n_sub = len({r["subject_id"] for r in rows})
+        logger.info(
+            "    %-18s %4d videos / %4d subjects = %.2f videos per subject",
+            dataset, n_vid, n_sub, n_vid / max(n_sub, 1),
+        )
+        if dataset == config.ff_dataset_name and config.ff_split_key != "video":
+            if n_sub >= n_vid:
+                logger.warning(
+                    "  FF++ has one subject per video (ff_split_key=%r) — the "
+                    "splits share content and every metric is optimistic. "
+                    "Run scripts/audit_ff_split.py.",
+                    config.ff_split_key,
+                )
+            else:
+                logger.info(
+                    "    FF++ grouped %d videos into %d subjects by %r",
+                    n_vid, n_sub, config.ff_split_key,
+                )
+
+    # ── split balance: each split's label mix against the corpus mix ─────────
+    logger.info("  Label balance per split (clip counts):")
+    for dataset in sorted({str(r["dataset"]) for r in all_records}):
+        rows = [r for r in all_records if str(r["dataset"]) == dataset]
+        clips_by = defaultdict(set)
+        for r in rows:
+            clips_by[(str(r["split"]), str(r["label"]))].add(
+                (r["video_index"], r["clip_index"])
+            )
+        labels = sorted({lab for _, lab in clips_by})
+        overall = {
+            lab: sum(len(v) for (_, l), v in clips_by.items() if l == lab)
+            for lab in labels
+        }
+        total = max(sum(overall.values()), 1)
+        logger.info(
+            "    %-18s overall %s",
+            dataset,
+            "  ".join(f"{lab}={overall[lab]} ({100*overall[lab]/total:.0f}%)"
+                      for lab in labels),
+        )
+        for split in ("train", "val", "test"):
+            counts = {lab: len(clips_by.get((split, lab), ())) for lab in labels}
+            n = sum(counts.values())
+            if n == 0:
+                continue
+            drift = max(
+                abs(counts[lab] / n - overall[lab] / total) for lab in labels
+            )
+            line = "  ".join(f"{lab}={counts[lab]} ({100*counts[lab]/n:.0f}%)"
+                             for lab in labels)
+            logger.info("      %-5s %5d clips  %s", split, n, line)
+            if min(counts.values()) == 0:
+                logger.warning(
+                    "  %s/%s is single-class — every guarded metric will return "
+                    "nothing for it", dataset, split,
+                )
+            elif drift > 0.05:
+                logger.warning(
+                    "  %s/%s label mix is %.0f pp off the corpus mix — check "
+                    "split_by_subject", dataset, split, 100 * drift,
+                )
     logger.info("─────────────────────────────────────────────")
 
 
@@ -835,11 +1318,16 @@ def run_pipeline(cfg: Config) -> None:
         config.min_face_score, config.disp_ratio, config.min_valid_frames,
     )
     if config.precompute_optical_flow:
+        # The array is (N-1, 2, R, R) int8, but it is written with
+        # savez_compressed — measured ~3.1x on the previous full run (385.9 KB
+        # raw -> ~126 KB on disk). Report the compressed figure, since that is
+        # the one a disk budget needs; the raw size would over-state it 3x.
+        raw_kb = (config.frames_per_clip - 1) * 2 * config.flow_resize ** 2 / 1024
         logger.info(
             "Optical flow: %s at %dpx → c<clip>_flow.npz beside the crops "
-            "(int8, ~%.1f KB/clip). Training reads these; it never computes flow.",
-            config.optical_flow_method, config.flow_resize,
-            (config.frames_per_clip - 1) * 2 * config.flow_resize ** 2 / 1024,
+            "(int8 %.0f KB raw, ~%.0f KB on disk after zip). Training reads "
+            "these; it never computes flow.",
+            config.optical_flow_method, config.flow_resize, raw_kb, raw_kb / 3.1,
         )
     else:
         logger.info("Optical flow precompute: OFF "
@@ -854,6 +1342,7 @@ def run_pipeline(cfg: Config) -> None:
         return
 
     logger.info("Total videos: %d", len(records))
+    plan_spoof_sampling(records, config)
     records = split_by_subject(records, config)
 
     # Power monitoring — same PowerMonitor the trainer uses, so the thesis can
@@ -889,7 +1378,7 @@ def run_pipeline(cfg: Config) -> None:
         logger.error("No frames extracted.")
         return
 
-    log_summary(all_frame_records)
+    log_summary(all_frame_records, config)
     write_all_csvs(all_frame_records, config.csv_dir, config)
     log_banner(logger, "Done")
 

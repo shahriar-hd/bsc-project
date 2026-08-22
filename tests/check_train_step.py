@@ -45,6 +45,9 @@ def grad_coverage(trainer, model, batch, dev):
     df_l = batch["deepfake_label"].to(dev).float()
     sp_l = batch["spoof_label"].to(dev).float()
     tp_l = batch["temporal_label"].to(dev).float()
+    tid = batch["task_id"].to(dev)
+    m_df = tid == T.TASK_DEEPFAKE
+    m_sp = tid == T.TASK_SPOOF
     # Mirrors _train_epoch: present only when use_optical_flow is on AND
     # preprocessing wrote the .npz files.
     flow = batch.get("flow")
@@ -52,8 +55,8 @@ def grad_coverage(trainer, model, batch, dev):
         flow = flow.to(dev)
     with trainer.autocast_ctx:
         out = model(frames, flow=flow)
-        loss = (trainer.criterion_df(out["deepfake_logit"], df_l)
-                + trainer.criterion_sp(out["spoof_logit"], sp_l)
+        loss = (trainer.criterion_df(out["deepfake_logit"].flatten()[m_df], df_l[m_df])
+                + trainer.criterion_sp(out["spoof_logit"].flatten()[m_sp], sp_l[m_sp])
                 + T.temporal_consistency_loss(
                     out["temp_proj"], tp_l,
                     logit=out["temp_logit"],
@@ -66,6 +69,99 @@ def grad_coverage(trainer, model, batch, dev):
             if id(p) in ids and p.grad is None]
     trainer.optimizer.zero_grad(set_to_none=True)
     return dead
+
+
+def check_task_mask(trainer, model, batch, dev):
+    """Each supervised loss must reach only the samples that own its label.
+
+    Tested at the input, not at the loss value: the gradient of the masked spoof
+    loss w.r.t. `frames` has to be exactly zero on every FaceForensics++ row and
+    non-zero on every SiW-Mv2 row. Comparing loss *values* would not catch it —
+    run01's unmasked `l_sp` was a perfectly finite number, computed against a
+    placeholder zero that taught the spoof head "a deepfake face is bona-fide".
+
+    Runs with the backbone's BatchNorm layers switched to their running
+    statistics, which is what makes the measurement mean anything. With BN in
+    training mode the normalisation pools statistics over the whole batch, so
+    *every* sample's activations depend on every other sample's and the spoof
+    loss shows a large gradient on FaceForensics++ frames even when the mask is
+    perfect (measured: 536 and 762 against 2350 and 426 on the SiW rows). That
+    coupling is inherent to BatchNorm on a mixed-task batch, not a labelling
+    error. Only the BN layers are switched — `model.eval()` would also disable
+    gradient checkpointing (`grad_checkpointing and self.training` in
+    forward_backbone), and the un-checkpointed float32 backward OOMs a 4 GB card.
+    """
+    tid = batch["task_id"].to(dev)
+    m_df = tid == T.TASK_DEEPFAKE
+    m_sp = tid == T.TASK_SPOOF
+    print(f"[mask] batch task_id={tid.tolist()} "
+          f"({int(m_df.sum())} deepfake + {int(m_sp.sum())} spoof)")
+    assert m_df.any() and m_sp.any(), (
+        "the batch is single-task — InterleavedBatchSampler must put both in "
+        "every batch or the masked losses have nothing to reduce over")
+
+    sp_l = batch["spoof_label"].to(dev).float()
+    df_l = batch["deepfake_label"].to(dev).float()
+
+    bns = [m for m in model.modules()
+           if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    bn_was_training = [m.training for m in bns]
+    for m in bns:
+        m.eval()
+    torch.cuda.empty_cache()
+    print(f"[mask] {len(bns)} BatchNorm layers on running stats for this check "
+          f"(batch statistics would couple all samples regardless of the mask)")
+
+    def per_sample_grad(masked_loss_fn):
+        frames = batch["frames"].to(dev).clone().requires_grad_(True)
+        model.zero_grad(set_to_none=True)
+        # float32 on purpose: under float16 autocast the small per-sample
+        # gradients underflow to zero everywhere, which would make the
+        # "exactly 0.0" assertion below pass vacuously.
+        out = model(frames)
+        masked_loss_fn(out).backward()
+        g = frames.grad.detach().abs().flatten(1).sum(1)
+        model.zero_grad(set_to_none=True)
+        del frames, out
+        torch.cuda.empty_cache()
+        return g
+
+    try:
+        g_sp = per_sample_grad(
+            lambda o: trainer.criterion_sp(o["spoof_logit"].flatten()[m_sp], sp_l[m_sp]))
+        g_df = per_sample_grad(
+            lambda o: trainer.criterion_df(o["deepfake_logit"].flatten()[m_df], df_l[m_df]))
+        tp_l = batch["temporal_label"].to(dev).float()
+        g_tp = per_sample_grad(
+            lambda o: T.temporal_consistency_loss(
+                o["temp_proj"], tp_l, logit=o["temp_logit"],
+                logit_weight=trainer.temporal_logit_weight))
+    finally:
+        for m, was in zip(bns, bn_was_training):
+            m.train(was)
+
+    # Scientific notation: focal loss on a confidently-correct sample leaves a
+    # gradient around 1e-10, which prints as "0.0" at fixed precision and would
+    # read as though the mask had killed it.
+    def fmt(g):
+        return "[" + ", ".join(f"{v:.2e}" for v in g.cpu().tolist()) + "]"
+
+    print(f"[mask] |d l_sp / d frames| per sample = {fmt(g_sp)}")
+    print(f"[mask] |d l_df / d frames| per sample = {fmt(g_df)}")
+    assert float(g_sp[m_df].abs().max()) == 0.0, (
+        "the spoof loss reaches FaceForensics++ samples — task mask is not applied")
+    assert float(g_sp[m_sp].min()) > 0.0, (
+        "the spoof loss does not reach its own SiW-Mv2 samples")
+    assert float(g_df[m_sp].abs().max()) == 0.0, (
+        "the deepfake loss reaches SiW-Mv2 samples — task mask is not applied")
+    assert float(g_df[m_df].min()) > 0.0, (
+        "the deepfake loss does not reach its own FaceForensics++ samples")
+
+    # The temporal head is supervised over the whole batch by design: its label
+    # ("inauthentic") is genuine ground truth in both datasets.
+    print(f"[mask] |d l_temp / d frames| per sample = {fmt(g_tp)}")
+    assert float(g_tp.min()) > 0.0, (
+        "the temporal loss must cover every sample — it is not masked by task")
 
 
 def main():
@@ -89,6 +185,11 @@ def main():
     batch = next(iter(loader))
     print(f"[data] frames={tuple(batch['frames'].shape)} dtype={batch['frames'].dtype}")
     assert batch["frames"].shape[1] == tc.num_frames, "T mismatch"
+    # Both tasks in every batch is what makes the masked losses well defined;
+    # check_sampler_balance.py asserts the quota over 200 batches.
+    tid0 = batch["task_id"]
+    assert (tid0 == T.TASK_DEEPFAKE).any() and (tid0 == T.TASK_SPOOF).any(), \
+        f"first batch is single-task: task_id={tid0.tolist()}"
 
     # ── Temporal consistency of augmentation ───────────────────────────
     # Albumentations' `images` target must apply ONE parameter draw to the whole
@@ -137,6 +238,8 @@ def main():
     model.train()
     tc_accum = tc.grad_accum_steps
     stepped = 0
+    overflows = 0
+    task_mix = []
     for step, b in enumerate(loader):
         if step >= STEPS:
             break
@@ -144,11 +247,19 @@ def main():
         df_l = b["deepfake_label"].to(dev, non_blocking=True).float()
         sp_l = b["spoof_label"].to(dev, non_blocking=True).float()
         tp_l = b["temporal_label"].to(dev, non_blocking=True).float()
+        tid = b["task_id"].to(dev, non_blocking=True)
+        m_df = tid == T.TASK_DEEPFAKE
+        m_sp = tid == T.TASK_SPOOF
+        task_mix.append((int(m_df.sum()), int(m_sp.sum())))
 
         with trainer.autocast_ctx:
             out = model(frames)
-            l_df = trainer.criterion_df(out["deepfake_logit"], df_l)
-            l_sp = trainer.criterion_sp(out["spoof_logit"], sp_l)
+            # Masked exactly as _train_epoch does — an unmasked l_sp here would
+            # let this script pass while the real loop trains on placeholders.
+            l_df = trainer.criterion_df(out["deepfake_logit"].flatten()[m_df],
+                                        df_l[m_df])
+            l_sp = trainer.criterion_sp(out["spoof_logit"].flatten()[m_sp],
+                                        sp_l[m_sp])
             l_tp = T.temporal_consistency_loss(
                 out["temp_proj"], tp_l,
                 logit=out["temp_logit"],
@@ -201,21 +312,35 @@ def main():
             trainer.scaler.update()
             trainer.optimizer.zero_grad(set_to_none=True)
             stepped += 1
+            overflow = not np.isfinite(gn.item())
+            overflows += int(overflow)
             print(f"[step] {step}: |grad|={gn.item():.4f} "
                   f"scale={trainer.scaler.get_scale():.0f} "
-                  f"loss(df/sp/tp)={l_df.item():.4f}/{l_sp.item():.4f}/{l_tp.item():.4f}")
+                  f"loss(df/sp/tp)={l_df.item():.4f}/{l_sp.item():.4f}/{l_tp.item():.4f}"
+                  f"{'  (float16 overflow — scaler skips this step)' if overflow else ''}")
             # clip_grad_norm_ must see the *unscaled* norm. log_weights is not in
             # the optimizer, so unscale_() skips it; clipping over
             # model.parameters() measured a norm inflated by the AMP scale and
             # shrank every real gradient by ~1e-4.
-            assert gn.item() < 1e3, (
+            #
+            # A non-finite norm is a different thing: some gradient overflowed
+            # float16 in the backward pass, and inf/scale is still inf. That is
+            # what GradScaler is for — it skips the step and halves the scale, so
+            # it is not a failure. Only a *finite* but inflated norm indicates the
+            # clip/unscale parameter sets have drifted apart.
+            assert overflow or gn.item() < 1e3, (
                 f"gradient norm {gn.item():.1f} looks AMP-scaled — "
                 f"clipping and unscaling must cover the same parameter set")
 
     T.apply_tsm = orig_tsm
 
     # ── Assertions ─────────────────────────────────────────────────────
-    print(f"\n[tsm ] applied at feature shapes: {sorted(set(hits))}")
+    print(f"\n[mask] task mix per step (deepfake, spoof): {task_mix}")
+    assert all(a > 0 and s > 0 for a, s in task_mix), (
+        f"a step ran with a single-task batch: {task_mix} — the masked loss for "
+        f"the missing task would have no samples to reduce over")
+
+    print(f"[tsm ] applied at feature shapes: {sorted(set(hits))}")
     assert hits, "TSM never fired"
     assert all(c[0] != 3 for c in hits), "TSM applied to raw RGB input"
 
@@ -233,7 +358,16 @@ def main():
     print(f"[upd ] task weights {w_before.cpu().numpy().round(4)} -> "
           f"{model.task_weights.detach().cpu().numpy().round(4)}")
     assert stepped > 0, "no optimizer step ran"
+    assert overflows < stepped, (
+        f"every one of {stepped} steps overflowed float16 — the scaler skipped "
+        f"them all, so nothing was learned. Check amp_dtype and the loss scale")
+    if overflows:
+        print(f"[amp ] {overflows}/{stepped} steps overflowed and were skipped by "
+              f"the scaler (normal for float16; the scale halves each time)")
     assert not nonfinite, f"non-finite params: {nonfinite[:5]}"
+
+    # ── Task mask ──────────────────────────────────────────────────────
+    check_task_mask(trainer, model, next(iter(loader)), dev)
 
     # ── Gradient coverage ──────────────────────────────────────────────
     # The right test for "is this parameter learning", *not* whether its value
@@ -283,19 +417,51 @@ def main():
     val_loader = T.build_interleaved_loader(ff_v, siw_v, cfg, is_train=False)
     metrics = trainer.validate(val_loader)
     print(f"\n[val ] {len(metrics)} metrics over {len(ff_v) + len(siw_v)} rows")
-    want = ["df_auc_roc", "df_eer", "df_ap", "df_acc_best_thresh",
-            "sp_apcer", "sp_bpcer", "sp_acer", "sp_hter", "sp_tpr_at_fpr1",
-            "tmp_bin_acc", "tmp_auc"]
+    # The threshold block is the half run01 did not log. `recall`/`f1`/`mcc` were
+    # 0.0 for the spoof head from epoch 2; the ACER that *was* logged sat at
+    # exactly 0.5, the value a coin flip produces.
+    shared = ["acc", "balanced_acc", "precision", "recall", "specificity", "f1",
+              "mcc", "auc_roc", "ap", "tn", "fp", "fn", "tp", "n_pos", "n_neg",
+              "pred_pos_rate", "score_min", "score_max",
+              "score_mean_pos", "score_mean_neg"]
+    want = ([f"df_{k}" for k in shared] + ["df_eer", "df_acc_best_thresh"]
+            + [f"sp_{k}" for k in shared]
+            + ["sp_apcer", "sp_bpcer", "sp_acer", "sp_hter", "sp_tpr_at_fpr1"]
+            + [f"tmp_{k}" for k in shared] + ["tmp_bin_acc"])
     missing = [k for k in want if k not in metrics]
-    for k in want:
+    head = ["df_auc_roc", "df_recall", "df_f1", "df_mcc", "df_eer",
+            "sp_auc_roc", "sp_recall", "sp_f1", "sp_mcc", "sp_acer",
+            "sp_pred_pos_rate", "sp_score_max",
+            "tmp_auc_roc", "tmp_bin_acc"]
+    for k in head + missing:
         v = metrics.get(k)
         print(f"       {k:20} = {v if v is None else round(float(v), 4)}"
               f"{'   <-- MISSING' if k in missing else ''}")
     assert not missing, f"metrics missing: {missing}; got {sorted(metrics)}"
+
+    # Per-attack-type recall — the table that says whether a *type* needs more
+    # data rather than the whole dataset.
+    per_type = sorted(k for k in metrics if k.startswith("sp_recall_"))
+    print(f"       per-type recall keys ({len(per_type)}): "
+          f"{[k.replace('sp_recall_', '') for k in per_type]}")
+    assert per_type, (
+        "no sp_recall_<type> keys — spoof_type is not reaching compute_spoof_metrics")
+    for k in per_type:
+        assert f"sp_n_{k[len('sp_recall_'):]}" in metrics, f"{k} has no support count"
+
     bad = [k for k, v in metrics.items()
            if isinstance(v, float) and not np.isfinite(v)]
     assert not bad, f"non-finite metrics: {bad}"
-    print(f"       also returned: {sorted(set(metrics) - set(want))}")
+    # Masking must also apply to the metric side: a mixed loader used to emit
+    # ff_sp_acer and friends, computed against placeholder labels.
+    assert metrics["df_n_pos"] + metrics["df_n_neg"] <= len(ff_v) / tc.num_frames + 1, \
+        "deepfake metrics were accumulated over SiW-Mv2 samples too"
+    assert metrics["sp_n_pos"] + metrics["sp_n_neg"] <= len(siw_v) / tc.num_frames + 1, \
+        "spoof metrics were accumulated over FaceForensics++ samples too"
+    print(f"       support: df n={metrics['df_n_pos']}+{metrics['df_n_neg']}  "
+          f"sp n={metrics['sp_n_pos']}+{metrics['sp_n_neg']}  "
+          f"tmp n={metrics['tmp_n_pos']}+{metrics['tmp_n_neg']}")
+    print(f"       also returned: {sorted(set(metrics) - set(want) - set(per_type))}")
 
     print("\nALL CHECKS PASSED")
 

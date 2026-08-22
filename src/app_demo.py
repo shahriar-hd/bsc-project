@@ -363,6 +363,22 @@ def load_mtl_model(device: torch.device):
     return model
 
 
+# Head name → the key `MTLModel.forward` actually returns (see train.py). Kept as
+# an explicit map, and checked below, because the previous hard-coded "df_logit" /
+# "sp_logit" did not match the model's "deepfake_logit" / "spoof_logit": every
+# capture path raised KeyError before printing a single score, which is what
+# "the camera produced no result" looked like from the outside.
+_HEAD_KEYS = {
+    "deepfake": "deepfake_logit",
+    "spoof":    "spoof_logit",
+    "temporal": "temp_logit",
+}
+
+# Per-head score range observed this session, so a head that never approaches its
+# threshold can be reported as unreachable instead of quietly always reading "OK".
+_score_seen: dict[str, list[float]] = {}
+
+
 def run_mtl_on_frames(
     model,
     cropped_rgb_list: list[np.ndarray],
@@ -374,28 +390,55 @@ def run_mtl_on_frames(
     with torch.no_grad():
         out = model(frames_tensor)
 
-    return {
-        "deepfake": torch.sigmoid(out["df_logit"]).item(),
-        "spoof":    torch.sigmoid(out["sp_logit"]).item(),
-        "temporal": torch.sigmoid(out["temp_logit"]).item(),
-    }
+    missing = [k for k in _HEAD_KEYS.values() if k not in out]
+    if missing:
+        raise KeyError(
+            f"MTLModel.forward returned {sorted(out)} — missing {missing}. "
+            f"Update _HEAD_KEYS in app_demo.py to match train.py."
+        )
+
+    scores: dict = {}
+    for name, key in _HEAD_KEYS.items():
+        logit = out[key].flatten().float()
+        score = torch.sigmoid(logit).item()
+        scores[name]            = score
+        scores[f"{name}_logit"] = logit.item()
+        _score_seen.setdefault(name, []).append(score)
+    return scores
 
 
 def check_mtl_results(scores: dict) -> bool:
     t       = cfg.model
     flagged = False
+    heads   = [
+        ("Deepfake Detection",   "deepfake", t.deepfake_threshold),
+        ("Anti-Spoofing",        "spoof",    t.spoof_threshold),
+        ("Temporal Consistency", "temporal", t.temporal_threshold),
+    ]
+
     print("\n  ── MTL Detection Report ──────────────────────────")
-    for label, key, threshold in [
-        ("Deepfake Detection",  "deepfake", t.deepfake_threshold),
-        ("Anti-Spoofing",       "spoof",    t.spoof_threshold),
-        ("Temporal Consistency","temporal", t.temporal_threshold),
-    ]:
+    for label, key, threshold in heads:
         score  = scores[key]
         status = "WARNING" if score > threshold else "OK"
-        print(f"  [{status}] {label}: score={score:.4f}  threshold={threshold:.2f}")
+        print(f"  [{status}] {label}: score={score:.4f}  "
+              f"logit={scores[f'{key}_logit']:+.4f}  threshold={threshold:.2f}")
         if score > threshold:
             flagged = True
     print("  ──────────────────────────────────────────────────")
+
+    # A head whose observed maximum sits below its threshold can only ever return
+    # "OK", so an all-OK verdict says nothing about that head. Report it, rather
+    # than letting a collapsed head read as a clean pass.
+    for label, key, threshold in heads:
+        seen = _score_seen.get(key, [])
+        if not seen:
+            continue
+        hi = max(seen)
+        if hi < threshold:
+            print(f"  [DIAG] {label}: max score this session {hi:.4f} < "
+                  f"threshold {threshold:.2f} over {len(seen)} clip(s) — this head "
+                  f"cannot flag anything. If the gap is large the head is likely "
+                  f"untrained; check siw_sp_auc/siw_sp_recall in results.csv.")
     return flagged
 
 
@@ -609,6 +652,30 @@ def test_batch(
     print(f"  Report  → {out_file}\n")
 
 
+def sanity_check_model(model, device: torch.device) -> None:
+    """
+    Push one synthetic clip through the model at startup and print every head's
+    raw output. This runs before any capture so a broken model path (missing
+    output key, wrong checkpoint, dead head) surfaces immediately instead of
+    after a 64-frame acquisition.
+
+    Scores here are meaningless — the input is grey noise-free filler. Only the
+    shapes, the keys, and whether a head is stuck are informative.
+    """
+    t    = cfg.model
+    clip = [np.full((224, 224, 3), 128, dtype=np.uint8)
+            for _ in range(_full_cfg.demo.camera.target_frames)]
+    scores = run_mtl_on_frames(model, clip, device)
+    _score_seen.clear()          # filler input must not pollute session extremes
+
+    print("  Model self-check (synthetic input — scores are not predictions):")
+    for name, thr in (("deepfake", t.deepfake_threshold),
+                      ("spoof",    t.spoof_threshold),
+                      ("temporal", t.temporal_threshold)):
+        print(f"    {name:9} logit={scores[f'{name}_logit']:+8.4f}  "
+              f"score={scores[name]:.4f}  threshold={thr:.2f}")
+
+
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -616,13 +683,13 @@ def main() -> None:
     print(  "║   Face Authentication Demo  (MTL)    ║")
     print(  "╚══════════════════════════════════════╝\n")
 
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device : {device}")
 
     print("  Loading models…")
     face_app  = get_face_app()
     mtl_model = load_mtl_model(device)
+    sanity_check_model(mtl_model, device)
     print("  Models loaded.\n")
 
     while True:

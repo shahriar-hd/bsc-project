@@ -9,12 +9,6 @@ Usage:
         --results results.csv \
         --master master.csv \
         --outdir plots
-
-Example:
-    python plot_training_and_dataset.py \
-        --results /home/shahriar/Documents/bank_did_auth/results.csv \
-        --master /home/shahriar/Documents/bank_did_auth/data/master.csv \
-        --outdir /home/shahriar/Documents/bank_did_auth/plots
 """
 
 import argparse
@@ -172,46 +166,45 @@ def plot_training_losses(df, outdir):
 
 def plot_training_metrics_dashboard(df, outdir):
     """
-    Main metrics dashboard.
+    Main metrics dashboard (Updated for new schema with FF and SiW splits).
     """
     x = "epoch"
 
+    # ستون‌های برمی‌گردند بر اساس ساختار جدید فایل results.csv
     metric_cols = [
-        "df_auc_roc",
-        "df_ap",
-        "df_eer",
-        "df_acc_best_thresh",
-        "df_video_auc",
-        "sp_auc",
-        "sp_acer",
-        "sp_hter",
-        "sp_tpr_at_fpr1",
-        "temp_bin_acc",
-        "temp_auc",
-        "temp_df_auc",
+        "ff_val_loss_df", "ff_df_auc_roc", "ff_df_eer", "ff_df_best_threshold",
+        "ff_sp_acer", "ff_sp_hter", "ff_tmp_bin_acc", "ff_tmp_auc",
+        "siw_val_loss_sp", "siw_sp_acer", "siw_sp_hter", "siw_sp_auc"
     ]
 
-    n_cols = 3
-    n_rows = int(np.ceil(len(metric_cols) / n_cols))
+    # حذف ستون‌هایی که ممکن است در دیتای واقعی وجود نداشته باشند
+    valid_cols = [col for col in metric_cols if col in df.columns]
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4.8 * n_rows))
-    axes = axes.flatten()
+    if not valid_cols:
+        print("[Skip] Validation metrics plot: no matching columns found.")
+        return
 
-    palette = sns.color_palette("tab10", len(metric_cols))
+    n_cols = 4
+    n_rows = int(np.ceil(len(valid_cols) / n_cols))
 
-    for i, col in enumerate(metric_cols):
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(22, 4.5 * n_rows))
+    axes = np.array(axes).flatten()
+
+    palette = sns.color_palette("tab10", len(valid_cols))
+
+    for i, col in enumerate(valid_cols):
         safe_lineplot(df, x, col, axes[i], title=col, color=palette[i % len(palette)])
 
-        # For metrics mostly in [0,1], make the axis easier to compare
+        # تنظیم محدوده Y برای متریک‌های بین 0 و 1
         if col in df.columns:
-            values = df[col].dropna()
+            values = pd.to_numeric(df[col], errors="coerce").dropna()
             if len(values) > 0 and values.min() >= 0 and values.max() <= 1:
                 axes[i].set_ylim(0, 1.05)
 
-    for j in range(len(metric_cols), len(axes)):
+    for j in range(len(valid_cols), len(axes)):
         axes[j].set_axis_off()
 
-    fig.suptitle("Training / Validation Metrics Dashboard", fontsize=22, fontweight="bold")
+    fig.suptitle("Training / Validation Metrics Dashboard (FF & SiW)", fontsize=22, fontweight="bold")
     save_fig(fig, Path(outdir) / "02_training_metrics_dashboard.png")
 
 
@@ -633,13 +626,13 @@ def plot_compact_final_report(results, master, outdir):
     safe_lineplot(results, "epoch", "loss_total", ax1, title="Total Loss", color="#e74c3c")
 
     ax2 = fig.add_subplot(gs[0, 1])
-    safe_lineplot(results, "epoch", "df_auc_roc", ax2, title="Deepfake AUC ROC", color="#3498db")
-    if "df_auc_roc" in results.columns:
+    safe_lineplot(results, "epoch", "ff_df_auc_roc", ax2, title="FF Deepfake AUC ROC", color="#3498db")
+    if "ff_df_auc_roc" in results.columns:
         ax2.set_ylim(0, 1.05)
 
     ax3 = fig.add_subplot(gs[0, 2])
-    safe_lineplot(results, "epoch", "sp_auc", ax3, title="Spoof AUC", color="#2ecc71")
-    if "sp_auc" in results.columns:
+    safe_lineplot(results, "epoch", "siw_sp_auc", ax3, title="SiW Spoof AUC", color="#2ecc71")
+    if "siw_sp_auc" in results.columns:
         ax3.set_ylim(0, 1.05)
 
     ax4 = fig.add_subplot(gs[1, 0])

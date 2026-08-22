@@ -86,9 +86,35 @@ class PreprocessConfig:
     # Random seed for reproducible splits
     split_seed: int = 42
 
+    # ── What keeps a FaceForensics++ video out of two splits ──────────────────
+    # Measured on the DFD actor subset shipped here (400 videos), by
+    # `scripts/audit_ff_split.py`:
+    #
+    #   "scene"     16 scripted scenarios, 9-35 videos each. Every one of the 200
+    #               fakes shares its scenario with a real video, so this is the
+    #               100 %-prevalence leak: the fake reuses that scenario's room,
+    #               lighting, framing and clothing and differs only in the face
+    #               region. Splitting here is clean AND label-balanced —
+    #               real 142/31/27, fake 138/31/31 (~50 % fake in every split).
+    #               Identities still span all splits; the residual is reported.
+    #   "identity"  26 actor tokens, but a fake names two actors and ties them
+    #               together — the union-find graph collapses to 3 components with
+    #               353/400 videos (88.2 %) in one, so an identity-disjoint split
+    #               does not exist. Assigning each fake to its first actor's split
+    #               gets identity leakage to 0 only at real 167/22/11, fake
+    #               186/11/3 — a test set resting on 3 fake videos. Scenario
+    #               overlap stays at 100 % either way.
+    #   "video"     one subject per video: what run01 used. Both leaks active,
+    #               which is why its 0.9899 test AUC is not a generalisation
+    #               estimate.
+    #
+    # "scene" is the default because it removes the leak that affects every fake
+    # and is the only option that yields usable, balanced val/test sets.
+    ff_split_key: str = "scene"           # "scene" | "identity" | "video"
+
     # ── Misc ──────────────────────────────────────────────────────────────────
     log_every_n_videos: int = 20          # progress log interval
-    jpeg_quality: int = 92                # 90-95: sharp enough, ~3× smaller than PNG
+    jpeg_quality: int = 95                # 90-95: sharp enough, ~3× smaller than PNG
 
     # ── Clip sampling ─────────────────────────────────────────────────────────
     # A clip is `frames_per_clip` frames taken every `frame_skip` source frames,
@@ -106,22 +132,28 @@ class PreprocessConfig:
     #   stride == clip span → clips are back-to-back, no shared frames
     #   stride <  clip span → clips overlap and share (span - stride) frames
     #
-    # Tuned on the measured frame-count distribution of the two datasets so
-    # that each task's own classes are balanced (that is what the deepfake BCE
-    # and the spoof focal loss actually see) and both datasets contribute a
-    # comparable number of clips (ff_sample_ratio=1.0 assumes this):
+    # All four are set to the clip span (64), i.e. back-to-back with zero shared
+    # frames, and the per-label caps below decide how many of those clips are
+    # kept. Measured clip yields (`starts_for_stride` over the real frame counts):
     #
-    #   FF++  real  200 videos, median 840 frames → ~1328 clips
-    #   FF++  fake  200 videos, median 703 frames → ~1297 clips   (ratio 1.02)
-    #   SiW   live  785 videos, median 179 frames → ~1260 clips
-    #   SiW   spoof 915 videos, median 150 frames → ~1263 clips   (ratio 1.00)
+    #   FF++  real  200 videos, median 840 frames, cap 7 → 1350 clips
+    #   FF++  fake  200 videos, median 696 frames, cap 7 → 1250 clips  (ratio 1.08)
+    #   SiW   live  785 videos, median 179 frames, cap 2 → 1311 clips
+    #   SiW   spoof 915 videos, per-type plan below     → 1364 clips  (ratio 1.04)
     #
-    # FF++ real and SiW live are both labelled "real" but need different
-    # strides (840 vs 179 median frames), hence two separate values.
-    clip_stride_real:  int = 120          # FF++ real  (no overlap, 56f gap)
-    clip_stride_fake:  int = 100          # FF++ fake  (no overlap, 36f gap)
-    clip_stride_live:  int = 120          # SiW-Mv2 live (no overlap)
-    clip_stride_spoof: int = 45           # SiW-Mv2 spoof (19f overlap: short videos)
+    # So ~2600 FF++ clips against ~2675 SiW clips: each task is class-balanced
+    # against itself, and the two tasks are balanced against each other, which
+    # matters because InterleavedBatchSampler recycles whichever side is smaller
+    # (run01 had 1287 FF vs 1533 SiW clips and saw every FF clip ~1.2x per epoch).
+    #
+    # A larger stride is what previously limited the yield, not the video length:
+    # at stride 120 with cap 4 the same videos gave only 773 real clips out of the
+    # ~7 non-overlapping windows an 840-frame video contains.
+    clip_stride_real:  int = 64            # FF++ real    (back-to-back)
+    clip_stride_fake:  int = 64            # FF++ fake    (back-to-back)
+    clip_stride_live:  int = 64            # SiW-Mv2 live (back-to-back)
+    clip_stride_spoof: int = 64            # SiW-Mv2 spoof fallback; the per-type
+                                           # plan below overrides it when enabled
 
     # Disallow overlapping frames between clips extracted from the same video.
     # If False, strides < span (e.g. spoof=45) will produce overlapping clips.
@@ -137,14 +169,45 @@ class PreprocessConfig:
     # Set to 1 to extract at least/most 1 clip per video, or > 1 for multiple clips.
     max_clips_per_video: int = 1
 
-    # Per-dataset and per-label clip caps for perfect dataset balancing across MTL heads:
-    # - FaceForensics++ (200 vids/class, ~800 frames each): 4 clips -> ~750-800 balanced clips
-    # - SiW-Mv2 (800-900 vids/class, ~160 frames each): 1 clip -> ~750-800 balanced clips
-    # This guarantees 1:1 balance for both Deepfake (FF) and Anti-Spoof (SiW) heads with 0 frame overlap.
-    max_clips_ff_real: Optional[int] = 4
-    max_clips_ff_fake: Optional[int] = 4
-    max_clips_siw_live: Optional[int] = 1
-    max_clips_siw_spoof: Optional[int] = 1
+    # Per-dataset and per-label clip caps. With every stride at the clip span,
+    # the stride finds all non-overlapping windows a video contains and the cap
+    # decides how many are kept — so these are the knobs that set dataset size
+    # and class balance. Yields are listed with the strides above.
+    #
+    # run01 used 4/4/1/1, which produced 1287 FF++ and 1533 SiW clips: a val split
+    # of only ~197 clips, where a single clip moves AUC by ~0.005 and the epoch
+    # curve looked like noise. These values roughly double both sides.
+    max_clips_ff_real: Optional[int] = 7
+    max_clips_ff_fake: Optional[int] = 7
+    max_clips_siw_live: Optional[int] = 2
+    max_clips_siw_spoof: Optional[int] = 1   # superseded per type by the plan below
+
+    # ── Per-attack-type clip balancing (SiW-Mv2 spoof only) ───────────────────
+    # The caps above balance the two *tasks* against each other, but say nothing
+    # about the 14 attack types inside SiW-Mv2 spoof, which are very unevenly
+    # represented. Measured video counts:
+    #
+    #   Partial_FunnyeyeGlasses 179   Mask_TransparentMask  60   Makeup_Obfuscation  22
+    #   Paper                   135   Partial_Eye           57   Mask_PaperMask      17
+    #   Replay                   98   Makeup_Cosmetic       52   Silicone            17
+    #   Partial_PaperGlasses     76   Mannequin             40
+    #   Mask_HalfMask            72   Partial_Mouth         29
+    #
+    # A 10.5x spread in videos, and run01 turned it into an 11.7x spread in
+    # frames. Rare types cannot be lifted to parity: Silicone has 17 videos of
+    # 210 frames, so reaching the 179-video types' clip count would need ~10
+    # near-identical clips from each, sharing 55+ of their 64 frames. The honest
+    # goal is therefore to *narrow* the gap, not close it — take more clips from
+    # the rare types' videos while a real frame gap still exists, take one from
+    # each video of the common types, and never drop a video (that would trade
+    # imbalance for lost identity/scene diversity). What remains is closed at
+    # training time, where a per-type sampling weight is free, and is reported
+    # per type by the `sp_recall_<type>` metrics.
+    #
+    # None disables this entirely and falls back to the flat clip_stride_spoof.
+    target_clips_per_spoof_type: Optional[int] = 90
+    max_clips_per_video_spoof: int = 4    # ceiling on clips from one spoof video
+    min_spoof_stride: int = 25            # floor on stride: caps overlap at 39/64 frames
 
     # ── Quality gate ──────────────────────────────────────────────────────────
     min_face_score: float = 0.65          # InsightFace det_score threshold
@@ -333,14 +396,29 @@ class TrainConfig:
     w_temporal: float = 1.0
 
     # Focal loss (spoof head)
+    #
+    # alpha = 0.5 is neutral. The RetinaNet convention (0.25) assumes the
+    # positive class is *rare* — it puts weight 0.25 on class 1 and 0.75 on
+    # class 0. Here class 1 is "presentation attack", which is ~52% of SiW-Mv2,
+    # so 0.25 down-weighted the class the head exists to detect by 3x. gamma
+    # still does the hard-example mining that focal loss is actually for.
     focal_gamma: float = 2.0
-    focal_alpha: float = 0.25
+    focal_alpha: float = 0.5
 
     # Gradient clipping
     max_grad_norm: float = 5.0
 
-    # Interleaved sampling ratio (FF++ : SiW-Mv2)
-    ff_sample_ratio: float = 1.0
+    # FF++ share of every training batch, enforced as a per-batch quota by
+    # InterleavedBatchSampler: 0.5 at batch_size=4 means 2 FF++ + 2 SiW-Mv2 in
+    # every batch. Clamped to [1, batch_size-1] slots, so no value can starve a
+    # task.
+    #
+    # This used to be a *sampling weight* (siw_weight = (1 - ratio) / n_siw), and
+    # the default of 1.0 therefore gave every SiW-Mv2 clip weight exactly 0.0.
+    # torch.multinomial never draws a zero-weight index, so run01 trained for 14
+    # epochs on FF++ alone: loss_sp was exactly 0.0 from epoch 2 and the spoof
+    # head never produced an output above 0.4978.
+    ff_sample_ratio: float = 0.5
 
     # ── Device & precision ──────────────────────────────────────────────────
     device: str = "cuda"               # "cuda", "cpu", or "cuda:0,1,..."
@@ -354,9 +432,38 @@ class TrainConfig:
     # ── Early stopping ───────────────────────────────────────────────────────
     use_early_stopping: bool = True
     early_stopping_patience: int = 7   # epochs without improvement before stopping
-    early_stopping_min_delta: float = 1e-4
-    early_stopping_metric: str = "primary"  # "primary" | "df_auc" | "sp_auc" | "acer"
-    early_stopping_mode: str = "max"        # "max" for AUC, "min" for ACER
+
+    # 1e-4 is below the resolution of the validation sets. One clip out of ~197
+    # moves AUC by ~0.005, so at 1e-4 pure jitter counts as "improvement" and
+    # the plateau in run01 (range 0.0139 over epochs 3-13) read as 11 epochs of
+    # progress followed by a patience countdown on noise.
+    early_stopping_min_delta: float = 2e-3
+
+    # Never stop before this epoch. warmup_epochs=3 puts the backbone at 3e-9 in
+    # epoch 0, so patience counted during warmup measures the schedule, not the
+    # model.
+    early_stopping_min_epochs: int = 8
+
+    # The *stop* decision uses a rolling mean over this many epochs; best.pth is
+    # still selected on the raw value. 1 disables smoothing.
+    early_stopping_smooth_window: int = 3
+
+    # Which validation metric drives best-model selection, the plateau scheduler
+    # and early stopping. "composite" uses composite_metric below; the others
+    # are single-task, for ablations.
+    early_stopping_metric: str = "composite"   # "composite" | "df_auc" | "sp_auc" | "acer"
+    early_stopping_mode: str = "max"           # "max" for AUC, "min" for ACER
+
+    # Composite formula:
+    #   "auc"  → 0.5 * ff_df_auc_roc + 0.5 * siw_sp_auc
+    #   "acer" → 0.5 * ff_df_auc_roc + 0.5 * (1 - siw_sp_acer)   (legacy)
+    #
+    # "acer" hid the run01 collapse. ACER = (APCER + BPCER) / 2 is exactly 0.5
+    # for a head that predicts one class for everything — identical to a coin
+    # flip — so the second term froze at 0.25 for all 14 epochs and the
+    # composite tracked deepfake AUC alone. siw_sp_auc for the same collapsed
+    # head was 0.41, i.e. visibly below chance. Both forms are always logged.
+    composite_metric: str = "auc"              # "auc" | "acer"
 
     # ── Warmup ─────────────────────────────
     warmup_epochs: int = 3             # linear warmup before cosine schedule
@@ -397,7 +504,7 @@ class AugConfig:
     hue_jitter: float = 0.05
     gaussian_blur_p: float = 0.2
     jpeg_compression_p: float = 0.3
-    jpeg_quality_min: int = 50
+    jpeg_quality_min: int = 75
     jpeg_quality_max: int = 95
     coarse_dropout_p: float = 0.1
     random_grayscale_p: float = 0.05
@@ -410,8 +517,22 @@ class AugConfig:
 @dataclass
 class EvalConfig:
     fpr_threshold: float = 0.01               # TPR @ FPR=1%
+
+    # Operating point for every threshold-dependent metric (accuracy, precision,
+    # recall, F1, MCC, APCER/BPCER/ACER). Kept here rather than hardcoded in the
+    # three metric functions so an ablation moves one number. `df_best_threshold`
+    # is still reported separately (Youden-J on the deepfake ROC) — this is the
+    # threshold the *reported* metrics and the demo actually use.
+    decision_threshold: float = 0.5
+
     # Video-level aggregation
     video_agg: str = "mean"                   # "mean" | "max"
+
+    # Compression breakdown. Requires a c23/c40 token in the source video paths;
+    # the raw FaceForensics++ layout here (DFD actor subset, e.g.
+    # "01_02__hugging_happy__YVGY8LOK.mp4") carries no such token, so this
+    # breakdown is unavailable and logged as such once per run rather than
+    # silently returning nothing.
     c23_label: str = "c23"                    # compression label in dataset col
     c40_label: str = "c40"
 
