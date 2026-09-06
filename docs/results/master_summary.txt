@@ -1,0 +1,53 @@
+=== Master Dataset Summary ===
+Total rows/frames: 309,837
+Datasets: 2
+
+Frames per dataset:
+dataset
+SiW-Mv2            165659
+FaceForensics++    144178
+
+Frames per split:
+split
+train    226765
+test      45200
+val       37872
+
+Frames per label:
+label
+real     158015
+spoof     82963
+fake      68859
+
+Frames per task:
+task
+spoof       165659
+deepfake    144178
+
+Frames per spoof_type:
+spoof_type
+none                       144178
+live                        82696
+Partial_FunnyeyeGlasses     10916
+Partial_PaperGlasses         9269
+Mask_HalfMask                8913
+Mask_TransparentMask         7114
+Makeup_Impersonation         6954
+Makeup_Cosmetic              6191
+Partial_Mouth                5773
+Partial_Eye                  5368
+Mannequin                    4732
+Replay                       4430
+Silicone                     3790
+Paper                        3765
+Makeup_Obfuscation           3648
+Mask_PaperMask               2100
+
+Unique subjects: 1,569
+Unique videos: 1,951
+
+Stats by dataset:
+                 frames  subjects  videos
+dataset                                  
+SiW-Mv2          165659      1553    1553
+FaceForensics++  144178        16     398

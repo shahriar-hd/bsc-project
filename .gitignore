@@ -81,6 +81,11 @@ node_modules/
 *.pth
 CLAUDE.md
 checkpoints/
+.claude
 
 # Runs
 runs/
+
+# docs
+docs/university-thesis/*.md
+docs/university-thesis/*.xlsx

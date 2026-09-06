@@ -1,0 +1,10 @@
+split,label,frames,subjects,videos
+test,fake,10068,3,29
+test,real,22073,116,140
+test,spoof,13059,120,120
+train,fake,52959,11,143
+train,real,116319,538,676
+train,spoof,57487,563,563
+val,fake,5832,2,26
+val,real,19623,116,138
+val,spoof,12417,116,116

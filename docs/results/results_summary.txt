@@ -1,0 +1,13 @@
+=== Results Summary ===
+Epochs: 0 to 13
+Number of rows: 14
+Total elapsed time: 6184.80 s
+Total elapsed time: 103.08 min
+Total elapsed time: 1.7180 h
+Mean power: 145.4707 W
+Min power: 143.5400 W
+Max power: 146.0100 W
+Total raw energy: 0.24990444 kWh
+Total adjusted energy: 0.28739011 kWh
+Total CO2: 141.9707 g
+Total CO2: 0.14197071 kg
