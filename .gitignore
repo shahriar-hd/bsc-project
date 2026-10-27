@@ -86,6 +86,15 @@ checkpoints/
 # Runs
 runs/
 
+# Upload staging: large converted weights live here until pushed to the Hub.
+# Ignore everything under .upload/ but keep the small helper scripts tracked
+# (negations work only because the directory itself is not ignored).
+.upload/*
+!.upload/convert_and_upload.py
+!.upload/MODEL_CARD.md
+!.upload/requirements-upload.txt
+!.upload/upload.sh
+
 # docs
 docs/university-thesis/*.md
 docs/university-thesis/*.xlsx

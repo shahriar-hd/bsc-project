@@ -1,0 +1,9 @@
+# .upload/ helpers run inside the training environment (bsc_project).
+# Only what the converter itself needs — the app/Space deps live elsewhere.
+torch>=2.0
+safetensors>=0.4
+onnx>=1.15
+onnxruntime>=1.17
+onnxscript>=0.1        # torch.onnx dynamo export backend (required on torch >= 2.9)
+huggingface_hub>=0.23
+numpy>=1.24
